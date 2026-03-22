@@ -1,11 +1,11 @@
 """
-BNI 台灣會員資料爬蟲 - 極致優化版 (Zero Selenium, Pure Async)
+BNI 全球會員資料爬蟲 - 極致優化版 (Zero Selenium, Pure Async)
 
 完全不使用 Selenium，改用 aiohttp 非同步 HTTP 請求：
 - 會員列表: POST /bnicms/v3/frontend/memberlist/display (AJAX)
 - 會員詳情: POST /bnicms/v3/frontend/memberdetail/display (AJAX)
 
-預估 248 分會 / ~9,651 會員，3-5 分鐘完成（原版 48 分鐘）
+支援 44 個國家，啟動時顯示文字選單選擇國家。
 
 用法: python bni_scraper_async.py [並行數，預設30]
 """
@@ -37,13 +37,61 @@ logger = logging.getLogger(__name__)
 
 # 常數
 BASE_URL = "https://bni.com.tw"
+COUNTRY_LIST_API = f"{BASE_URL}/web/open/appsCmsCountryListJson"
 REGION_API = f"{BASE_URL}/web/open/appsCmsNationalChapterSearchFilterJson"
 MEMBERLIST_PAGE = f"{BASE_URL}/zh-TW/memberlist"
 MEMBERLIST_AJAX = f"{BASE_URL}/bnicms/v3/frontend/memberlist/display"
 MEMBERDETAIL_PAGE = f"{BASE_URL}/zh-TW/memberdetails"
 MEMBERDETAIL_AJAX = f"{BASE_URL}/bnicms/v3/frontend/memberdetail/display"
-COUNTRY_ID = 7699
 MAX_RETRIES = 3
+
+# 已知的 44 個國家 (ID → 名稱, 區域數)
+COUNTRIES = {
+    2: ("Costa Rica", 1),
+    5: ("Cyprus", 5),
+    10: ("United States", 213),
+    364: ("Antarctica", 66),
+    460: ("Slovenia", 1),
+    464: ("Barbados", 1),
+    470: ("Suriname", 1),
+    1010: ("South Africa", 21),
+    1138: ("United Arab Emirates", 9),
+    1418: ("Kenya", 3),
+    1923: ("Romania", 28),
+    1924: ("Malta", 1),
+    1925: ("Zimbabwe", 1),
+    1926: ("Nigeria", 9),
+    2777: ("Colombia", 24),
+    3278: ("Malaysia", 25),
+    3376: ("Denmark", 9),
+    3435: ("Finland", 10),
+    3445: ("Norway", 9),
+    3488: ("Poland", 32),
+    3521: ("Mexico", 72),
+    3542: ("Brazil", 90),
+    3548: ("Switzerland", 9),
+    3622: ("Spain", 41),
+    3650: ("Belgium (French)", 6),
+    3655: ("France", 70),
+    3800: ("Portugal", 15),
+    3857: ("India", 174),
+    3908: ("Italy", 54),
+    3979: ("Thailand", 18),
+    5723: ("Austria", 7),
+    5768: ("Germany", 60),
+    6117: ("Sweden", 31),
+    7585: ("Singapore", 6),
+    7638: ("Japan", 69),
+    7699: ("Taiwan", 31),
+    7732: ("Vietnam", 24),
+    7744: ("South Korea", 25),
+    7751: ("Hong Kong", 2),
+    7872: ("Ireland", 8),
+    7984: ("Netherlands", 21),
+    8150: ("United Kingdom", 79),
+    9517: ("Tanzania", 1),
+    9742: ("Macau", 1),
+}
 
 HEADERS = {
     "User-Agent": (
@@ -53,6 +101,7 @@ HEADERS = {
 }
 
 CSV_FIELDS = [
+    "country_id", "country_name",
     "region_id", "region_name", "chapter_id", "chapter_name",
     "member_name", "title", "company", "industry", "city",
     "phone", "mobile", "address", "postal_code", "website",
@@ -62,11 +111,170 @@ CSV_FIELDS = [
 ]
 
 
-async def get_widget_settings(session):
+def show_country_menu():
+    """顯示國家選單，回傳選擇的國家 ID 列表"""
+    sorted_countries = sorted(COUNTRIES.items(), key=lambda x: x[1][0])
+
+    print("\n" + "=" * 60)
+    print("  BNI 全球會員爬蟲 - 國家選擇")
+    print("=" * 60)
+
+    # 分欄顯示
+    for i, (cid, (name, regions)) in enumerate(sorted_countries, 1):
+        print(f"  {i:2d}. {name:<25s} ({regions:>3d} 區域)", end="")
+        if i % 2 == 0:
+            print()
+        else:
+            print("  ", end="")
+    if len(sorted_countries) % 2 == 1:
+        print()
+
+    print(f"\n  {len(sorted_countries)+1:2d}. ** 全部國家 **")
+    print("=" * 60)
+    print("  輸入編號（可多選，用逗號分隔，例: 1,3,5）")
+    print("  直接按 Enter 預設爬取 Taiwan")
+    print("=" * 60)
+
+    while True:
+        choice = input("\n  請選擇: ").strip()
+
+        if not choice:
+            # 預設 Taiwan
+            return [7699]
+
+        try:
+            nums = [int(x.strip()) for x in choice.split(",")]
+        except ValueError:
+            print("  ❌ 請輸入數字編號")
+            continue
+
+        all_option = len(sorted_countries) + 1
+        if all_option in nums:
+            return list(COUNTRIES.keys())
+
+        selected = []
+        valid = True
+        for n in nums:
+            if 1 <= n <= len(sorted_countries):
+                cid = sorted_countries[n - 1][0]
+                selected.append(cid)
+            else:
+                print(f"  ❌ 無效編號: {n}")
+                valid = False
+                break
+
+        if valid and selected:
+            names = [COUNTRIES[cid][0] for cid in selected]
+            print(f"\n  ✅ 已選擇: {', '.join(names)}")
+            return selected
+
+
+async def fetch_regions(session, country_id):
+    """取得指定國家的區域列表"""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            async with session.post(REGION_API, data={
+                "countryId": country_id,
+                "request_locale": "en_US",
+            }, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                data = await resp.json()
+                return data.get("regions", [])
+        except Exception as e:
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(1)
+            else:
+                logger.warning("國家 %s 區域取得失敗: %s", country_id, e)
+    return []
+
+
+async def fetch_chapters_for_region(session, country_id, region, settings, sem):
+    """用 AJAX 取得一個區域內所有分會的會員（一次 API call 拿整個區域）"""
+    region_id = region["id"]
+    region_name = region["name"]
+
+    params = (
+        f"countryIds={country_id}&regionId={region_id}&chapterName="
+        f"&chapterArea=&memberKeywords=&chapterCity="
+        f"&memberFirstName=&memberLastName=&memberCompany="
+    )
+
+    async with sem:
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                async with session.post(MEMBERLIST_AJAX, data={
+                    "parameters": params,
+                    "languages": settings["list_langs"],
+                    "cmsv3": "true",
+                    "mappedWidgetSettings": settings["list_mws"],
+                    "pageMode": "Live_Site",
+                    "website_type": "1",
+                    "website_id": "10065",
+                }, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    html_text = await resp.text()
+
+                if len(html_text) < 100:
+                    if attempt < MAX_RETRIES:
+                        await asyncio.sleep(0.5)
+                        continue
+                    return []
+
+                soup = BeautifulSoup(html_text, "html.parser")
+                rows = soup.select("table tbody tr")
+
+                members = []
+                for row in rows:
+                    cells = row.find_all("td")
+                    if len(cells) < 6:
+                        continue
+                    texts = [c.get_text(strip=True) for c in cells]
+
+                    member_name = texts[1]
+                    if not member_name:
+                        continue
+
+                    # 解析 chapter-region 欄位
+                    chapter_region = texts[2]
+                    chapter_name = chapter_region.split(" - ")[0].strip() if " - " in chapter_region else chapter_region
+
+                    link = cells[1].find("a", href=re.compile(r"memberdetails"))
+                    detail_url = link["href"] if link else ""
+                    if detail_url and not detail_url.startswith("http"):
+                        detail_url = f"{BASE_URL}/zh-TW/{detail_url}"
+
+                    members.append({
+                        "country_id": country_id,
+                        "country_name": COUNTRIES.get(country_id, ("?", 0))[0],
+                        "region_id": region_id,
+                        "region_name": region_name,
+                        "chapter_id": "",
+                        "chapter_name": chapter_name,
+                        "member_name": member_name,
+                        "company": texts[6] if len(texts) > 6 else "",
+                        "industry": texts[5] if len(texts) > 5 else "",
+                        "city": texts[3] if len(texts) > 3 else "",
+                        "detail_url": detail_url,
+                    })
+
+                return members
+
+            except asyncio.TimeoutError:
+                logger.warning("區域 %s 超時 (attempt %d)", region_name, attempt)
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(1)
+            except Exception as e:
+                logger.warning("區域 %s 失敗 (attempt %d): %s", region_name, attempt, e)
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(0.5)
+
+    logger.warning("區域 %s: 最終失敗", region_name)
+    return []
+
+
+async def get_widget_settings(session, country_id):
     """從 memberlist 頁面取得 mappedWidgetSettings 和 languages"""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            async with session.get(MEMBERLIST_PAGE, params={"countryIds": COUNTRY_ID}) as resp:
+            async with session.get(MEMBERLIST_PAGE, params={"countryIds": country_id}) as resp:
                 text = await resp.text()
 
             mws = ""
@@ -116,95 +324,6 @@ async def get_widget_settings(session):
                 await asyncio.sleep(1)
 
     raise RuntimeError("無法取得 widget settings")
-
-
-async def fetch_chapter_members(session, chapter, settings, sem):
-    """用 AJAX 取得一個分會的會員列表"""
-    region_id = chapter["region_id"]
-    chapter_id = chapter["chapter_id"]
-    chapter_name = chapter["chapter_name"]
-    region_name = chapter["region_name"]
-
-    params = (
-        f"countryIds={COUNTRY_ID}&regionId={region_id}&chapterName={chapter_id}"
-        f"&chapterArea=&memberKeywords=&chapterCity="
-        f"&memberFirstName=&memberLastName=&memberCompany="
-    )
-
-    async with sem:
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                async with session.post(MEMBERLIST_AJAX, data={
-                    "parameters": params,
-                    "languages": settings["list_langs"],
-                    "cmsv3": "true",
-                    "mappedWidgetSettings": settings["list_mws"],
-                    "pageMode": "Live_Site",
-                    "website_type": "1",
-                    "website_id": "10065",
-                }, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                    html_text = await resp.text()
-
-                if len(html_text) < 100:
-                    if attempt < MAX_RETRIES:
-                        await asyncio.sleep(0.5)
-                        continue
-                    return []
-
-                soup = BeautifulSoup(html_text, "html.parser")
-                rows = soup.select("table tbody tr")
-
-                members = []
-                for row in rows:
-                    cells = row.find_all("td")
-                    if len(cells) < 6:
-                        continue
-                    texts = [c.get_text(strip=True) for c in cells]
-
-                    # Column 0 (hidden): group ("Exact Matches" or "More Results...")
-                    # 只取 Exact Matches
-                    if texts[0] != "Exact Matches":
-                        continue
-
-                    member_name = texts[1]
-                    if not member_name:
-                        continue
-
-                    # 從 chapter-region column 確認是目標分會
-                    chapter_region = texts[2]
-                    if chapter_name not in chapter_region:
-                        continue
-
-                    link = cells[1].find("a", href=re.compile(r"memberdetails"))
-                    detail_url = link["href"] if link else ""
-                    if detail_url and not detail_url.startswith("http"):
-                        detail_url = f"{BASE_URL}/zh-TW/{detail_url}"
-
-                    members.append({
-                        "region_id": region_id,
-                        "region_name": region_name,
-                        "chapter_id": chapter_id,
-                        "chapter_name": chapter_name,
-                        "member_name": member_name,
-                        "company": texts[6] if len(texts) > 6 else "",
-                        "industry": texts[5] if len(texts) > 5 else "",
-                        "city": texts[3] if len(texts) > 3 else "",
-                        "detail_url": detail_url,
-                    })
-
-                return members
-
-            except asyncio.TimeoutError:
-                logger.warning("分會 %s 超時 (attempt %d)", chapter_name, attempt)
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(1)
-            except Exception as e:
-                logger.warning("分會 %s 失敗 (attempt %d): %s", chapter_name, attempt, e)
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(0.5)
-
-    logger.warning("分會 %s: 最終失敗", chapter_name)
-    return []
 
 
 def parse_member_detail(html_content, member):
@@ -355,80 +474,44 @@ def save_members_csv(members, filename):
     logger.info("已儲存 %d 筆至 %s", len(members), filename)
 
 
-def load_chapters_csv(filename="bni_chapters.csv"):
-    """載入分會列表"""
-    with open(filename, "r", encoding="utf-8-sig") as f:
-        return list(csv.DictReader(f))
+async def scrape_country(session, country_id, settings, concurrency):
+    """爬取一個國家的所有會員"""
+    country_name = COUNTRIES.get(country_id, ("Unknown", 0))[0]
+    logger.info("=" * 50)
+    logger.info("開始爬取: %s (ID: %d)", country_name, country_id)
 
+    # 1. 取得區域列表
+    regions = await fetch_regions(session, country_id)
+    if not regions:
+        logger.warning("%s: 無區域資料", country_name)
+        return []
 
-def load_completed_chapters(filename="bni_members_progress_async.csv"):
-    """載入已完成的分會"""
-    path = Path(filename)
-    if not path.exists():
-        return set(), []
-    completed = set()
-    members = []
-    with open(path, "r", encoding="utf-8-sig") as f:
-        for row in csv.DictReader(f):
-            completed.add(row.get("chapter_id", ""))
-            members.append(row)
-    return completed, members
+    logger.info("%s: %d 個區域", country_name, len(regions))
 
+    # 2. 並行取得所有區域的會員列表
+    sem = asyncio.Semaphore(concurrency)
+    tasks = [fetch_chapters_for_region(session, country_id, r, settings, sem) for r in regions]
 
-async def main():
-    concurrency = int(sys.argv[1]) if len(sys.argv) > 1 else 30
-    logger.info("啟動非同步爬蟲，並行數: %d", concurrency)
+    all_members = []
+    regions_done = 0
+    regions_total = len(regions)
 
-    # 載入分會列表
-    chapters = load_chapters_csv()
-    logger.info("載入 %d 個分會", len(chapters))
+    for coro in asyncio.as_completed(tasks):
+        members = await coro
+        all_members.extend(members)
+        regions_done += 1
+        if regions_done % 10 == 0 or regions_done == regions_total:
+            logger.info("[%s] 區域進度: %d/%d (%d%%) - 累計 %d 位",
+                        country_name, regions_done, regions_total,
+                        int(regions_done / regions_total * 100),
+                        len(all_members))
 
-    # 載入已完成
-    completed, existing_members = load_completed_chapters()
-    if completed:
-        logger.info("跳過 %d 個已完成分會 (%d 筆會員)", len(completed), len(existing_members))
+    logger.info("[%s] 會員列表完成: %d 位", country_name, len(all_members))
 
-    pending = [ch for ch in chapters if ch["chapter_id"] not in completed]
-    logger.info("待處理: %d 個分會", len(pending))
-
-    if not pending:
-        logger.info("所有分會已完成!")
-        return
-
-    start_time = time.time()
-
-    connector = aiohttp.TCPConnector(limit=concurrency, limit_per_host=concurrency, ttl_dns_cache=300)
-    async with aiohttp.ClientSession(headers=HEADERS, connector=connector) as session:
-        # 1. 取得 widget settings
-        settings = await get_widget_settings(session)
-
-        # 2. 並行取得所有分會的會員列表
-        logger.info("=== 階段一：取得會員列表 ===")
-        list_sem = asyncio.Semaphore(concurrency)
-        list_tasks = [fetch_chapter_members(session, ch, settings, list_sem) for ch in pending]
-
-        all_members = list(existing_members)
-        chapters_done = 0
-        chapters_total = len(pending)
-
-        for coro in asyncio.as_completed(list_tasks):
-            members = await coro
-            all_members.extend(members)
-            chapters_done += 1
-            if chapters_done % 20 == 0 or chapters_done == chapters_total:
-                logger.info("會員列表進度: %d/%d (%d%%) - 累計 %d 位",
-                            chapters_done, chapters_total,
-                            int(chapters_done / chapters_total * 100),
-                            len(all_members))
-
-        list_time = time.time() - start_time
-        new_members = all_members[len(existing_members):]
-        logger.info("會員列表完成: %d 位新會員，耗時 %.1f 秒", len(new_members), list_time)
-
-        # 3. 並行取得所有會員詳情
-        logger.info("=== 階段二：取得會員詳情 ===")
+    # 3. 並行取得所有會員詳情
+    if all_members:
         detail_sem = asyncio.Semaphore(concurrency)
-        detail_tasks = [fetch_member_detail(session, m, settings, detail_sem) for m in new_members]
+        detail_tasks = [fetch_member_detail(session, m, settings, detail_sem) for m in all_members]
 
         details_done = 0
         details_total = len(detail_tasks)
@@ -436,29 +519,62 @@ async def main():
         for coro in asyncio.as_completed(detail_tasks):
             await coro
             details_done += 1
-            if details_done % 200 == 0 or details_done == details_total:
-                logger.info("會員詳情進度: %d/%d (%d%%)",
-                            details_done, details_total,
+            if details_done % 500 == 0 or details_done == details_total:
+                logger.info("[%s] 詳情進度: %d/%d (%d%%)",
+                            country_name, details_done, details_total,
                             int(details_done / details_total * 100))
 
-        # 中途存檔
-        save_members_csv(all_members, "bni_members_progress_async.csv")
+    logger.info("[%s] 完成! %d 位會員", country_name, len(all_members))
+    return all_members
+
+
+async def main():
+    concurrency = int(sys.argv[1]) if len(sys.argv) > 1 else 30
+
+    # 國家選擇選單
+    selected_ids = show_country_menu()
+    selected_names = [COUNTRIES[cid][0] for cid in selected_ids]
+    total_regions = sum(COUNTRIES[cid][1] for cid in selected_ids)
+
+    print(f"\n  準備爬取 {len(selected_ids)} 個國家, {total_regions} 個區域")
+    print(f"  並行數: {concurrency}")
+    print()
+
+    start_time = time.time()
+
+    connector = aiohttp.TCPConnector(limit=concurrency, limit_per_host=concurrency, ttl_dns_cache=300)
+    async with aiohttp.ClientSession(headers=HEADERS, connector=connector) as session:
+        # 取得 widget settings
+        settings = await get_widget_settings(session, selected_ids[0])
+
+        # 逐國爬取
+        all_members = []
+        for country_id in selected_ids:
+            members = await scrape_country(session, country_id, settings, concurrency)
+            all_members.extend(members)
+
+            # 每個國家存一份
+            if members:
+                country_name = COUNTRIES[country_id][0].lower().replace(" ", "_")
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                save_members_csv(members, f"bni_members_{country_name}_{timestamp}.csv")
 
     elapsed = time.time() - start_time
-    logger.info("全部完成! 耗時 %.1f 秒 (%.1f 分鐘)，共 %d 位會員", elapsed, elapsed / 60, len(all_members))
 
-    # 最終存檔
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_members_csv(all_members, f"bni_members_{timestamp}.csv")
-    save_members_csv(all_members, "bni_members_progress_async.csv")
+    # 全部存一份總檔
+    if len(selected_ids) > 1 and all_members:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_members_csv(all_members, f"bni_members_all_{timestamp}.csv")
 
     # 統計
-    print(f"\n{'='*60}")
-    print(f"完成! 共 {len(all_members)} 位會員")
-    print(f"耗時: {elapsed:.1f} 秒 ({elapsed/60:.1f} 分鐘)")
-    print(f"並行數: {concurrency}")
-    print(f"速度: {len(all_members)/elapsed:.1f} 會員/秒")
-    print(f"{'='*60}")
+    print(f"\n{'=' * 60}")
+    print(f"  爬取完成!")
+    print(f"  國家: {', '.join(selected_names)}")
+    print(f"  會員總數: {len(all_members):,}")
+    print(f"  耗時: {elapsed:.1f} 秒 ({elapsed/60:.1f} 分鐘)")
+    if elapsed > 0:
+        print(f"  速度: {len(all_members)/elapsed:.1f} 會員/秒")
+    print(f"{'=' * 60}")
 
 
 if __name__ == "__main__":
