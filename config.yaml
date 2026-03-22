@@ -1,0 +1,14 @@
+# ===== BNI 會員爬蟲設定檔 =====
+
+# 授權設定（由管理員提供）
+license:
+  api_url: ""    # Google Apps Script 部署 URL
+  key: ""        # 你的授權碼
+
+# 爬取設定
+scrape:
+  concurrency: 30      # 並行請求數（建議 20-50）
+
+# 輸出設定
+output:
+  dir: "output"        # 輸出目錄

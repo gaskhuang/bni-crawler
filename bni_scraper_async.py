@@ -529,6 +529,12 @@ async def scrape_country(session, country_id, settings, concurrency):
 
 
 async def main():
+    # 授權驗證
+    from license_check import require_license
+    customer = require_license()
+    if customer:
+        print(f"  歡迎, {customer}!\n")
+
     concurrency = int(sys.argv[1]) if len(sys.argv) > 1 else 30
 
     # 國家選擇選單

@@ -16,3 +16,11 @@ ajax_*.html
 # IDE
 .vscode/
 .idea/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# License cache
+.license_cache.json
