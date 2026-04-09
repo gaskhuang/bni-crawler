@@ -25,11 +25,14 @@ from bs4 import BeautifulSoup
 
 from bni_core import (
     BASE_URL,
+    FIND_A_MEMBER_URL,
     MEMBER_FIELDS,
+    MEMBER_LIST_URL,
     MEMBERLIST_AJAX,
     MEMBER_DETAIL_AJAX,
     MEMBER_DETAIL_URL,
     append_members_csv,
+    create_driver,
     parse_member_detail_html,
     write_members_csv,
     _extract_mapped_widget_settings,
@@ -312,6 +315,103 @@ async def fetch_regions(session: aiohttp.ClientSession, country_id: int) -> list
 # ─────────────────────────── Chapter/member list ─────────────────────────────
 
 
+def discover_all_chapters_selenium(country_id: int, regions: list) -> list:
+    """
+    用 Selenium（headless Chrome）一次性爬取所有區域的分會清單。
+    Chapter dropdown 是 JS 動態載入，只有真實瀏覽器能看到。
+
+    流程：開啟 findamember → Advanced Search tab → 逐一選 region → 讀 chapter dropdown
+    回傳：[{chapter_id, chapter_name, region_id, region_name}, ...]
+    """
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait, Select
+    from selenium.webdriver.support import expected_conditions as EC
+
+    logger.info("使用 Selenium 發現分會清單（共 %d 個區域）...", len(regions))
+    driver = create_driver(headless=True)
+    all_chapters = []
+
+    try:
+        # Load findamember page once
+        driver.get(FIND_A_MEMBER_URL)
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, 'a[href="#search-advanced-tab"]')
+            )
+        )
+        # Click Advanced Search tab
+        driver.execute_script(
+            'document.querySelector(\'a[href="#search-advanced-tab"]\').click();'
+        )
+        WebDriverWait(driver, 15).until(
+            EC.visibility_of_element_located(
+                (By.CSS_SELECTOR, '#search-advanced select[name="regionId"]')
+            )
+        )
+        # Dismiss cookie if present
+        try:
+            btn = driver.find_element(By.CSS_SELECTOR, 'button[id*="cookie"], .cookie-accept, #onetrust-accept-btn-handler')
+            btn.click()
+        except Exception:
+            pass
+
+        for region in regions:
+            region_id = str(region["id"])
+            region_name = region.get("name", region_id)
+            try:
+                # Select region
+                region_sel = Select(
+                    driver.find_element(By.CSS_SELECTOR, '#search-advanced select[name="regionId"]')
+                )
+                region_sel.select_by_value(region_id)
+
+                # Wait for chapter dropdown to populate (>1 option means it loaded)
+                WebDriverWait(driver, 15).until(
+                    lambda d: len(
+                        Select(d.find_element(By.CSS_SELECTOR, '#search-advanced select[name="chapterName"]')).options
+                    ) > 1
+                )
+
+                chapter_sel = Select(
+                    driver.find_element(By.CSS_SELECTOR, '#search-advanced select[name="chapterName"]')
+                )
+                chapters = []
+                for opt in chapter_sel.options:
+                    val = opt.get_attribute("value") or ""
+                    text = opt.text.strip()
+                    if val:
+                        chapters.append({
+                            "chapter_id": val,
+                            "chapter_name": text,
+                            "region_id": region_id,
+                            "region_name": region_name,
+                        })
+
+                if chapters:
+                    all_chapters.extend(chapters)
+                    logger.info("  區域 %s: %d 個分會", region_name, len(chapters))
+                else:
+                    all_chapters.append({
+                        "chapter_id": "",
+                        "chapter_name": region_name,
+                        "region_id": region_id,
+                        "region_name": region_name,
+                    })
+            except Exception as e:
+                logger.warning("區域 %s 分會發現失敗: %s，以區域代替", region_name, e)
+                all_chapters.append({
+                    "chapter_id": "",
+                    "chapter_name": region_name,
+                    "region_id": region_id,
+                    "region_name": region_name,
+                })
+    finally:
+        driver.quit()
+
+    logger.info("分會發現完成: 共 %d 個分會", len(all_chapters))
+    return all_chapters
+
+
 async def _ajax_memberlist(
     session: aiohttp.ClientSession,
     settings: dict,
@@ -428,72 +528,6 @@ def _parse_member_rows(
     return members
 
 
-async def fetch_chapters_for_region(
-    session: aiohttp.ClientSession,
-    country_id: int,
-    region: dict,
-    settings: dict,
-    sem: asyncio.Semaphore,
-) -> list:
-    """
-    取得一個區域內所有分會的會員。
-
-    策略：
-    1. 先做一次 region-level call（chapterName 空值）
-    2. 從 HTML 解析 chapter dropdown，取得所有 chapter ID
-    3. 若有 chapter dropdown（多分會區域），對每個 chapter 各別呼叫
-    4. 若無 dropdown（單一分會或 API 無下拉選單），直接使用 region-level 結果
-    這樣可以避免 API 每次最多 ~200 筆的截斷問題。
-    """
-    region_id = region["id"]
-    region_name = region["name"]
-
-    region_params = (
-        f"countryIds={country_id}&regionId={region_id}&chapterName="
-        f"&chapterArea=&memberKeywords=&chapterCity="
-        f"&memberFirstName=&memberLastName=&memberCompany="
-    )
-
-    async with sem:
-        # Step 1: region-level call to discover chapters
-        html_text = await _ajax_memberlist(session, settings, region_params, region_name)
-        if len(html_text) < 100:
-            logger.warning("區域 %s: 空回應", region_name)
-            return []
-
-        chapters = _parse_chapter_options(html_text)
-
-        # Step 2a: No chapter dropdown → use region-level result directly
-        if not chapters:
-            members = _parse_member_rows(html_text, country_id, region_id, region_name)
-            logger.debug("區域 %s (無 dropdown): %d 位", region_name, len(members))
-            return members
-
-        # Step 2b: Has chapters → fetch per chapter to avoid row-limit truncation
-        logger.debug("區域 %s: 發現 %d 個分會，逐一抓取", region_name, len(chapters))
-        all_members = []
-        for ch in chapters:
-            ch_id = ch["chapter_id"]
-            ch_name = ch["chapter_name"]
-            ch_params = (
-                f"countryIds={country_id}&regionId={region_id}&chapterName={ch_id}"
-                f"&chapterArea=&memberKeywords=&chapterCity="
-                f"&memberFirstName=&memberLastName=&memberCompany="
-            )
-            ch_html = await _ajax_memberlist(
-                session, settings, ch_params, f"{region_name}/{ch_name}"
-            )
-            if len(ch_html) < 100:
-                continue
-            ch_members = _parse_member_rows(
-                ch_html, country_id, region_id, region_name,
-                chapter_id=ch_id, chapter_name_filter=ch_name,
-            )
-            all_members.extend(ch_members)
-            pass  # no inter-chapter delay at high concurrency
-
-        logger.debug("區域 %s: 共 %d 位 (來自 %d 分會)", region_name, len(all_members), len(chapters))
-        return all_members
 
 
 # ─────────────────────────── Member detail ───────────────────────────────────
@@ -562,28 +596,6 @@ async def fetch_member_detail(
 # ─────────────────────────── Country scraper ─────────────────────────────────
 
 
-def _load_chapters_by_region(csv_path: str = "bni_chapters.csv") -> dict:
-    """
-    Load bni_chapters.csv and return {region_id: [{chapter_id, chapter_name, region_name}]}.
-    Returns empty dict if file not found.
-    """
-    import csv
-    p = Path(csv_path)
-    if not p.exists():
-        return {}
-    chapters_by_region: dict = {}
-    with p.open(encoding="utf-8-sig") as f:
-        for row in csv.DictReader(f):
-            rid = str(row.get("region_id", "")).strip()
-            if not rid:
-                continue
-            chapters_by_region.setdefault(rid, []).append({
-                "chapter_id": str(row.get("chapter_id", "")).strip(),
-                "chapter_name": str(row.get("chapter_name", "")).strip(),
-                "region_name": str(row.get("region_name", "")).strip(),
-            })
-    return chapters_by_region
-
 
 async def fetch_members_for_chapter(
     session: aiohttp.ClientSession,
@@ -628,9 +640,11 @@ async def scrape_country(
     Widget settings are fetched **per country** so that the correct
     ``mappedWidgetSettings`` is used for each country's pages.
 
-    策略：
-    - 若 bni_chapters.csv 有對應的分會資料 → 按分會逐一抓取（避免 API 截斷）
-    - 否則 → 按區域抓取（fallback）
+    流程：
+    1. 取得區域列表
+    2. 動態發現每個區域的分會（GET memberlist 頁面解析 dropdown）
+    3. 對每個分會呼叫 AJAX 取得會員（避免 API ~200 筆截斷）
+    4. 抓每位會員的詳情
     """
     country_name = COUNTRIES.get(country_id, ("Unknown", 0))[0]
     logger.info("=" * 50)
@@ -645,38 +659,28 @@ async def scrape_country(
         logger.warning("%s: 無區域資料", country_name)
         return []
 
-    logger.info("%s: %d 個區域", country_name, len(regions))
+    logger.info("%s: %d 個區域，正在用 Selenium 發現分會...", country_name, len(regions))
 
-    # 2. Check for pre-loaded chapter data
-    chapters_by_region = _load_chapters_by_region()
+    # 2. Discover chapters via Selenium (chapter dropdown is JS-rendered)
+    loop = asyncio.get_event_loop()
+    all_chapters = await loop.run_in_executor(
+        None, discover_all_chapters_selenium, country_id, regions
+    )
+    total_chapters = len(all_chapters)
+    logger.info("%s: 發現 %d 個分會", country_name, total_chapters)
 
     sem = asyncio.Semaphore(concurrency)
 
-    # Build task list: per-chapter if CSV available, per-region as fallback
-    tasks = []
-    task_labels = []  # for progress tracking
-    for r in regions:
-        rid = str(r["id"])
-        rname = r.get("name", rid)
-        pre_chapters = chapters_by_region.get(rid, [])
-        if pre_chapters:
-            for ch in pre_chapters:
-                tasks.append(
-                    fetch_members_for_chapter(session, country_id, rid, rname, ch, settings, sem)
-                )
-                task_labels.append(f"{rname}/{ch['chapter_name']}")
-        else:
-            tasks.append(fetch_chapters_for_region(session, country_id, r, settings, sem))
-            task_labels.append(rname)
-
+    # 3. Build member-fetch tasks (one per chapter)
+    tasks = [
+        fetch_members_for_chapter(
+            session, country_id,
+            ch["region_id"], ch["region_name"],
+            ch, settings, sem,
+        )
+        for ch in all_chapters
+    ]
     total_tasks = len(tasks)
-    using_chapters = sum(
-        len(chapters_by_region.get(str(r["id"]), [])) for r in regions
-    )
-    if using_chapters:
-        logger.info("%s: 按分會抓取 (%d 個分會)", country_name, using_chapters)
-    else:
-        logger.info("%s: 按區域抓取 (無分會清單)", country_name)
 
     all_members: list = []
     done = 0

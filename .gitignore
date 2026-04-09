@@ -40,3 +40,4 @@ test_*.py
 codex-session-id
 .claude/
 bni_regions.csv
+bni_chapters.csv
