@@ -3,7 +3,8 @@ __pycache__/
 *.pyc
 .venv/
 
-# Output data (large CSV files)
+# Output data
+output/
 bni_members_*.csv
 bni_members_progress*.csv
 
@@ -13,14 +14,27 @@ bni_members_progress*.csv
 # Debug/test HTML
 ajax_*.html
 
-# IDE
+# IDE & OS
 .vscode/
 .idea/
+.DS_Store
 
-# PyInstaller
+# PyInstaller / Windows build
 build/
 dist/
 *.spec
+build_windows.bat
+build_windows.py
 
-# License cache
+# License
+license_check.py
 .license_cache.json
+
+# Test/debug scripts
+test_*.py
+
+# Session cache
+.context/
+
+# Codex session
+codex-session-id

@@ -7,13 +7,11 @@ BNI 全球會員資料爬蟲 - 極致優化版 (Zero Selenium, Pure Async)
 
 支援 44 個國家，啟動時顯示文字選單選擇國家。
 
-用法: python bni_scraper_async.py [並行數，預設30]
+用法: python bni_scraper_async.py [並行數，預設5]
 """
 
 import asyncio
-import csv
 import html as html_mod
-import json
 import logging
 import re
 import sys
@@ -22,9 +20,41 @@ from datetime import datetime
 from pathlib import Path
 
 import aiohttp
+import yaml
 from bs4 import BeautifulSoup
 
-# 設定日誌
+from bni_core import (
+    BASE_URL,
+    MEMBER_FIELDS,
+    MEMBERLIST_AJAX,
+    MEMBER_DETAIL_AJAX,
+    MEMBER_DETAIL_URL,
+    append_members_csv,
+    parse_member_detail_html,
+    write_members_csv,
+    _extract_mapped_widget_settings,
+)
+
+# ── config ────────────────────────────────────────────────────────────────────
+
+def _load_config(path: str = "config.yaml") -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return yaml.safe_load(fh) or {}
+    except FileNotFoundError:
+        return {}
+
+_CFG = _load_config()
+_SCRAPE_CFG = _CFG.get("scrape", {})
+_OUTPUT_CFG = _CFG.get("output", {})
+
+DEFAULT_CONCURRENCY: int = int(_SCRAPE_CFG.get("concurrency", 5))
+MAX_RETRIES: int = int(_SCRAPE_CFG.get("retry_attempts", 3))
+OUTPUT_DIR: str = _OUTPUT_CFG.get("dir", "output")
+OUTPUT_FILENAME: str = _OUTPUT_CFG.get("filename", "bni_members.csv")
+
+# ── logging ───────────────────────────────────────────────────────────────────
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -35,15 +65,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 常數
-BASE_URL = "https://bni.com.tw"
+# ── constants ─────────────────────────────────────────────────────────────────
+
 COUNTRY_LIST_API = f"{BASE_URL}/web/open/appsCmsCountryListJson"
 REGION_API = f"{BASE_URL}/web/open/appsCmsNationalChapterSearchFilterJson"
 MEMBERLIST_PAGE = f"{BASE_URL}/zh-TW/memberlist"
-MEMBERLIST_AJAX = f"{BASE_URL}/bnicms/v3/frontend/memberlist/display"
-MEMBERDETAIL_PAGE = f"{BASE_URL}/zh-TW/memberdetails"
-MEMBERDETAIL_AJAX = f"{BASE_URL}/bnicms/v3/frontend/memberdetail/display"
-MAX_RETRIES = 3
+MEMBERDETAIL_PAGE = MEMBER_DETAIL_URL
 
 # 已知的 44 個國家 (ID → 名稱, 區域數)
 COUNTRIES = {
@@ -100,15 +127,7 @@ HEADERS = {
     ),
 }
 
-CSV_FIELDS = [
-    "country_id", "country_name",
-    "region_id", "region_name", "chapter_id", "chapter_name",
-    "member_name", "title", "company", "industry", "city",
-    "phone", "mobile", "address", "postal_code", "website",
-    "business_desc", "ideal_referral", "best_product",
-    "top_problem_solved", "ideal_referral_partner", "favorite_story",
-    "line_url", "detail_url",
-]
+# ─────────────────────────── Country menu ────────────────────────────────────
 
 
 def show_country_menu():
@@ -119,7 +138,6 @@ def show_country_menu():
     print("  BNI 全球會員爬蟲 - 國家選擇")
     print("=" * 60)
 
-    # 分欄顯示
     for i, (cid, (name, regions)) in enumerate(sorted_countries, 1):
         print(f"  {i:2d}. {name:<25s} ({regions:>3d} 區域)", end="")
         if i % 2 == 0:
@@ -139,13 +157,12 @@ def show_country_menu():
         choice = input("\n  請選擇: ").strip()
 
         if not choice:
-            # 預設 Taiwan
             return [7699]
 
         try:
             nums = [int(x.strip()) for x in choice.split(",")]
         except ValueError:
-            print("  ❌ 請輸入數字編號")
+            print("  請輸入數字編號")
             continue
 
         all_option = len(sorted_countries) + 1
@@ -159,122 +176,41 @@ def show_country_menu():
                 cid = sorted_countries[n - 1][0]
                 selected.append(cid)
             else:
-                print(f"  ❌ 無效編號: {n}")
+                print(f"  無效編號: {n}")
                 valid = False
                 break
 
         if valid and selected:
             names = [COUNTRIES[cid][0] for cid in selected]
-            print(f"\n  ✅ 已選擇: {', '.join(names)}")
+            print(f"\n  已選擇: {', '.join(names)}")
             return selected
 
 
-async def fetch_regions(session, country_id):
-    """取得指定國家的區域列表"""
+# ─────────────────────────── Widget settings (per-country) ───────────────────
+
+
+async def get_widget_settings(session: aiohttp.ClientSession, country_id: int) -> dict:
+    """
+    Fetch widget settings from the member-list and member-detail pages for the
+    given *country_id*.
+
+    Widget settings are country-specific (the memberlist page is parameterised
+    with ``countryIds``), so this must be called once per country rather than
+    once globally.
+    """
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            async with session.post(REGION_API, data={
-                "countryId": country_id,
-                "request_locale": "en_US",
-            }, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                data = await resp.json()
-                return data.get("regions", [])
-        except Exception as e:
-            if attempt < MAX_RETRIES:
-                await asyncio.sleep(1)
-            else:
-                logger.warning("國家 %s 區域取得失敗: %s", country_id, e)
-    return []
-
-
-async def fetch_chapters_for_region(session, country_id, region, settings, sem):
-    """用 AJAX 取得一個區域內所有分會的會員（一次 API call 拿整個區域）"""
-    region_id = region["id"]
-    region_name = region["name"]
-
-    params = (
-        f"countryIds={country_id}&regionId={region_id}&chapterName="
-        f"&chapterArea=&memberKeywords=&chapterCity="
-        f"&memberFirstName=&memberLastName=&memberCompany="
-    )
-
-    async with sem:
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                async with session.post(MEMBERLIST_AJAX, data={
-                    "parameters": params,
-                    "languages": settings["list_langs"],
-                    "cmsv3": "true",
-                    "mappedWidgetSettings": settings["list_mws"],
-                    "pageMode": "Live_Site",
-                    "website_type": "1",
-                    "website_id": "10065",
-                }, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                    html_text = await resp.text()
-
-                if len(html_text) < 100:
-                    if attempt < MAX_RETRIES:
-                        await asyncio.sleep(0.5)
-                        continue
-                    return []
-
-                soup = BeautifulSoup(html_text, "html.parser")
-                rows = soup.select("table tbody tr")
-
-                members = []
-                for row in rows:
-                    cells = row.find_all("td")
-                    if len(cells) < 6:
-                        continue
-                    texts = [c.get_text(strip=True) for c in cells]
-
-                    member_name = texts[1]
-                    if not member_name:
-                        continue
-
-                    # 解析 chapter-region 欄位
-                    chapter_region = texts[2]
-                    chapter_name = chapter_region.split(" - ")[0].strip() if " - " in chapter_region else chapter_region
-
-                    link = cells[1].find("a", href=re.compile(r"memberdetails"))
-                    detail_url = link["href"] if link else ""
-                    if detail_url and not detail_url.startswith("http"):
-                        detail_url = f"{BASE_URL}/zh-TW/{detail_url}"
-
-                    members.append({
-                        "country_id": country_id,
-                        "country_name": COUNTRIES.get(country_id, ("?", 0))[0],
-                        "region_id": region_id,
-                        "region_name": region_name,
-                        "chapter_id": "",
-                        "chapter_name": chapter_name,
-                        "member_name": member_name,
-                        "company": texts[6] if len(texts) > 6 else "",
-                        "industry": texts[5] if len(texts) > 5 else "",
-                        "city": texts[3] if len(texts) > 3 else "",
-                        "detail_url": detail_url,
-                    })
-
-                return members
-
-            except asyncio.TimeoutError:
-                logger.warning("區域 %s 超時 (attempt %d)", region_name, attempt)
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(1)
-            except Exception as e:
-                logger.warning("區域 %s 失敗 (attempt %d): %s", region_name, attempt, e)
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(0.5)
-
-    logger.warning("區域 %s: 最終失敗", region_name)
-    return []
-
-
-async def get_widget_settings(session, country_id):
-    """從 memberlist 頁面取得 mappedWidgetSettings 和 languages"""
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            async with session.get(MEMBERLIST_PAGE, params={"countryIds": country_id}) as resp:
+            async with session.get(
+                MEMBERLIST_PAGE,
+                params={"countryIds": country_id},
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                if resp.status not in (200, 304):
+                    raise aiohttp.ClientResponseError(
+                        resp.request_info, resp.history,
+                        status=resp.status,
+                        message=f"Unexpected status {resp.status} fetching memberlist page",
+                    )
                 text = await resp.text()
 
             mws = ""
@@ -287,18 +223,19 @@ async def get_widget_settings(session, country_id):
             if m2:
                 langs = m2.group(1)
 
-            # 也取得 memberdetail 的 settings
-            async with session.get(MEMBERDETAIL_PAGE) as resp2:
+            async with session.get(
+                MEMBERDETAIL_PAGE,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp2:
+                if resp2.status not in (200, 304):
+                    raise aiohttp.ClientResponseError(
+                        resp2.request_info, resp2.history,
+                        status=resp2.status,
+                        message=f"Unexpected status {resp2.status} fetching memberdetail page",
+                    )
                 text2 = await resp2.text()
 
-            detail_mws = ""
-            m3 = re.search(r'name="mappedWidgetSettings"\s+value="([^"]*)"', text2)
-            if m3:
-                detail_mws = html_mod.unescape(m3.group(1))
-            else:
-                m3 = re.search(r"var mappedWidgetSettings = '(\[.*?\])';", text2)
-                if m3:
-                    detail_mws = m3.group(1)
+            detail_mws = _extract_mapped_widget_settings(text2)
 
             detail_langs = ""
             m4 = re.search(r"var languages = (\{.*?\}\});", text2, re.DOTALL)
@@ -306,129 +243,273 @@ async def get_widget_settings(session, country_id):
                 detail_langs = m4.group(1)
 
             if not mws:
-                logger.warning("mappedWidgetSettings not found (attempt %d)", attempt)
+                logger.warning(
+                    "mappedWidgetSettings not found for country %d (attempt %d)",
+                    country_id, attempt,
+                )
                 if attempt < MAX_RETRIES:
                     await asyncio.sleep(1)
                     continue
 
-            logger.info("Widget settings loaded (mws=%d, langs=%d, detail_mws=%d)", len(mws), len(langs), len(detail_mws))
+            logger.info(
+                "Widget settings loaded for country %d "
+                "(mws=%d, langs=%d, detail_mws=%d)",
+                country_id, len(mws), len(langs), len(detail_mws),
+            )
             return {
                 "list_mws": mws,
                 "list_langs": langs,
                 "detail_mws": detail_mws,
                 "detail_langs": detail_langs,
             }
+        except aiohttp.ClientResponseError:
+            raise
         except Exception as e:
-            logger.warning("取得 widget settings 失敗 (attempt %d): %s", attempt, e)
+            logger.warning(
+                "取得 widget settings 失敗 country=%d attempt=%d: %s",
+                country_id, attempt, e,
+            )
             if attempt < MAX_RETRIES:
                 await asyncio.sleep(1)
 
-    raise RuntimeError("無法取得 widget settings")
+    raise RuntimeError(f"無法取得 widget settings (country={country_id})")
 
 
-def parse_member_detail(html_content, member):
-    """解析會員詳情 HTML（同步，CPU-bound）"""
-    if not html_content or len(html_content) < 50:
-        return member
-
-    soup = BeautifulSoup(html_content, "html.parser")
-
-    # 電話: 從 <a href="tel:...">
-    tel_links = soup.find_all("a", href=re.compile(r"^tel:"))
-    phones = list(dict.fromkeys(a.get_text(strip=True) for a in tel_links if a.get_text(strip=True)))
-    if phones:
-        member["phone"] = phones[0]
-    if len(phones) > 1:
-        member["mobile"] = phones[1]
-
-    # 文字分段解析
-    body_text = soup.get_text(separator="\n")
-    lines = [l.strip() for l in body_text.split("\n") if l.strip()]
-
-    section_markers = {
-        "My Business": "business_desc", "我的業務": "business_desc",
-        "Ideal Referral": "ideal_referral", "理想的引薦": "ideal_referral",
-        "Top Problem Solved": "top_problem_solved", "解決過的最大難題": "top_problem_solved",
-        "My Ideal Referral Partner": "ideal_referral_partner", "我理想中的引薦搭檔": "ideal_referral_partner",
-        "Top Product": "best_product", "最佳產品": "best_product",
-        "My Favorite BNI Story": "favorite_story",
-    }
-
-    sections = {}
-    current_section = "header"
-    section_lines = []
-
-    for line in lines:
-        if line in section_markers:
-            if section_lines:
-                sections[current_section] = section_lines
-            current_section = line
-            section_lines = []
-        else:
-            section_lines.append(line)
-    if section_lines:
-        sections[current_section] = section_lines
-
-    # Header 解析
-    header = sections.get("header", [])
-    chapter_idx = -1
-    for i, line in enumerate(header):
-        if line == "Chapter":
-            chapter_idx = i
-            break
-
-    if chapter_idx >= 0:
-        if chapter_idx >= 3:
-            member["industry"] = header[2]
-
-        after_chapter = header[chapter_idx + 1:]
-        if after_chapter:
-            after_chapter = after_chapter[1:]  # 跳過分會名
-
-        title_idx = -1
-        for i, line in enumerate(after_chapter):
-            if re.match(r"^(Dr\.|Mr\.|Ms\.|Mrs\.|博士|先生|小姐|女士)", line):
-                title_idx = i
-                member["title"] = line
-                break
-
-        if title_idx >= 0:
-            info = after_chapter[title_idx + 1:]
-            addr_lines = info[1:] if len(info) > 1 else []
-            addr_parts = []
-            for line in addr_lines:
-                if re.match(r"^https?://|^www\.", line):
-                    member["website"] = line
-                    break
-                if re.match(r"^\d{3,5}$", line):
-                    member["postal_code"] = line
-                    continue
-                if line and not line.startswith(("BNI", "Links")):
-                    addr_parts.append(line)
-            if addr_parts:
-                member["address"] = " ".join(addr_parts)
-
-    # 段落內容
-    for marker, field in section_markers.items():
-        content = sections.get(marker, [])
-        if content and not member.get(field):
-            member[field] = "\n".join(content)
-
-    # LINE URL
-    line_urls = re.findall(r'https?://line\.me/[^\s"\'<>]+', html_content)
-    if line_urls:
-        member["line_url"] = line_urls[0]
-
-    return member
+# ─────────────────────────── Region fetching ─────────────────────────────────
 
 
-async def fetch_member_detail(session, member, settings, sem):
+async def fetch_regions(session: aiohttp.ClientSession, country_id: int) -> list:
+    """取得指定國家的區域列表"""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            async with session.post(
+                REGION_API,
+                data={"countryId": country_id, "request_locale": "en_US"},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status not in (200, 304):
+                    raise aiohttp.ClientResponseError(
+                        resp.request_info, resp.history,
+                        status=resp.status,
+                        message=f"Unexpected status {resp.status} fetching regions",
+                    )
+                data = await resp.json()
+                return data.get("regions", [])
+        except aiohttp.ClientResponseError as exc:
+            if exc.status in (403, 429, 500):
+                raise
+            logger.warning("國家 %s 區域取得失敗 attempt=%d: %s", country_id, attempt, exc)
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(1)
+        except Exception as e:
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(1)
+            else:
+                logger.warning("國家 %s 區域取得失敗: %s", country_id, e)
+    return []
+
+
+# ─────────────────────────── Chapter/member list ─────────────────────────────
+
+
+async def _ajax_memberlist(
+    session: aiohttp.ClientSession,
+    settings: dict,
+    params_str: str,
+    label: str,
+) -> str:
+    """POST to MEMBERLIST_AJAX and return the HTML text. Raises on HTTP errors."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            async with session.post(
+                MEMBERLIST_AJAX,
+                data={
+                    "parameters": params_str,
+                    "languages": settings["list_langs"],
+                    "cmsv3": "true",
+                    "mappedWidgetSettings": settings["list_mws"],
+                    "pageMode": "Live_Site",
+                    "website_type": "1",
+                    "website_id": "10065",
+                },
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status in (403, 429, 500):
+                    raise aiohttp.ClientResponseError(
+                        resp.request_info, resp.history,
+                        status=resp.status,
+                        message=f"HTTP {resp.status} on memberlist for {label}",
+                    )
+                return await resp.text()
+        except aiohttp.ClientResponseError:
+            raise
+        except asyncio.TimeoutError:
+            logger.warning("%s 超時 (attempt %d)", label, attempt)
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(1)
+        except Exception as e:
+            logger.warning("%s 失敗 (attempt %d): %s", label, attempt, e)
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(0.5)
+    return ""
+
+
+def _parse_chapter_options(html_text: str) -> list:
+    """
+    Extract chapter IDs and names from the chapterName <select> dropdown.
+    Returns list of {chapter_id, chapter_name} dicts. Empty if no dropdown found.
+    """
+    soup = BeautifulSoup(html_text, "html.parser")
+    sel = soup.find("select", {"name": "chapterName"})
+    if not sel:
+        return []
+    chapters = []
+    for opt in sel.find_all("option"):
+        val = opt.get("value", "").strip()
+        text = opt.get_text(strip=True)
+        if val and val != "0":
+            chapters.append({"chapter_id": val, "chapter_name": text})
+    return chapters
+
+
+def _parse_member_rows(
+    html_text: str,
+    country_id: int,
+    region_id: str,
+    region_name: str,
+    chapter_id: str = "",
+    chapter_name_filter: str = "",
+) -> list:
+    """Parse member rows from memberlist HTML and return member dicts."""
+    soup = BeautifulSoup(html_text, "html.parser")
+    rows = soup.select("table tbody tr")
+    members = []
+    country_name = COUNTRIES.get(country_id, ("?", 0))[0]
+
+    for row in rows:
+        cells = row.find_all("td")
+        if len(cells) < 6:
+            continue
+        texts = [c.get_text(strip=True) for c in cells]
+
+        member_name = texts[1]
+        if not member_name:
+            continue
+
+        chapter_region = texts[2]
+        parsed_chapter_name = (
+            chapter_region.split(" - ")[0].strip()
+            if " - " in chapter_region
+            else chapter_region
+        )
+
+        # Front-end filter when fetching by chapter_id to avoid cross-contamination
+        if chapter_name_filter and chapter_name_filter not in chapter_region:
+            continue
+
+        link = cells[1].find("a", href=re.compile(r"memberdetails"))
+        detail_url = link["href"] if link else ""
+        if detail_url and not detail_url.startswith("http"):
+            detail_url = f"{BASE_URL}/zh-TW/{detail_url}"
+
+        members.append({
+            "country_id": country_id,
+            "country_name": country_name,
+            "region_id": region_id,
+            "region_name": region_name,
+            "chapter_id": chapter_id,
+            "chapter_name": parsed_chapter_name,
+            "member_name": member_name,
+            "company": texts[6] if len(texts) > 6 else "",
+            "industry": texts[5] if len(texts) > 5 else "",
+            "city": texts[3] if len(texts) > 3 else "",
+            "detail_url": detail_url,
+        })
+    return members
+
+
+async def fetch_chapters_for_region(
+    session: aiohttp.ClientSession,
+    country_id: int,
+    region: dict,
+    settings: dict,
+    sem: asyncio.Semaphore,
+) -> list:
+    """
+    取得一個區域內所有分會的會員。
+
+    策略：
+    1. 先做一次 region-level call（chapterName 空值）
+    2. 從 HTML 解析 chapter dropdown，取得所有 chapter ID
+    3. 若有 chapter dropdown（多分會區域），對每個 chapter 各別呼叫
+    4. 若無 dropdown（單一分會或 API 無下拉選單），直接使用 region-level 結果
+    這樣可以避免 API 每次最多 ~200 筆的截斷問題。
+    """
+    region_id = region["id"]
+    region_name = region["name"]
+
+    region_params = (
+        f"countryIds={country_id}&regionId={region_id}&chapterName="
+        f"&chapterArea=&memberKeywords=&chapterCity="
+        f"&memberFirstName=&memberLastName=&memberCompany="
+    )
+
+    async with sem:
+        # Step 1: region-level call to discover chapters
+        html_text = await _ajax_memberlist(session, settings, region_params, region_name)
+        if len(html_text) < 100:
+            logger.warning("區域 %s: 空回應", region_name)
+            return []
+
+        chapters = _parse_chapter_options(html_text)
+
+        # Step 2a: No chapter dropdown → use region-level result directly
+        if not chapters:
+            members = _parse_member_rows(html_text, country_id, region_id, region_name)
+            logger.debug("區域 %s (無 dropdown): %d 位", region_name, len(members))
+            return members
+
+        # Step 2b: Has chapters → fetch per chapter to avoid row-limit truncation
+        logger.debug("區域 %s: 發現 %d 個分會，逐一抓取", region_name, len(chapters))
+        all_members = []
+        for ch in chapters:
+            ch_id = ch["chapter_id"]
+            ch_name = ch["chapter_name"]
+            ch_params = (
+                f"countryIds={country_id}&regionId={region_id}&chapterName={ch_id}"
+                f"&chapterArea=&memberKeywords=&chapterCity="
+                f"&memberFirstName=&memberLastName=&memberCompany="
+            )
+            ch_html = await _ajax_memberlist(
+                session, settings, ch_params, f"{region_name}/{ch_name}"
+            )
+            if len(ch_html) < 100:
+                continue
+            ch_members = _parse_member_rows(
+                ch_html, country_id, region_id, region_name,
+                chapter_id=ch_id, chapter_name_filter=ch_name,
+            )
+            all_members.extend(ch_members)
+            pass  # no inter-chapter delay at high concurrency
+
+        logger.debug("區域 %s: 共 %d 位 (來自 %d 分會)", region_name, len(all_members), len(chapters))
+        return all_members
+
+
+# ─────────────────────────── Member detail ───────────────────────────────────
+
+
+async def fetch_member_detail(
+    session: aiohttp.ClientSession,
+    member: dict,
+    settings: dict,
+    sem: asyncio.Semaphore,
+) -> dict:
     """用 AJAX 取得單一會員詳情"""
     detail_url = member.get("detail_url", "")
     if not detail_url:
         return member
 
-    # 從 URL 取得 parameters
     if "?" in detail_url:
         parameters = detail_url.split("?", 1)[1]
     else:
@@ -437,19 +518,33 @@ async def fetch_member_detail(session, member, settings, sem):
     async with sem:
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                async with session.post(MEMBERDETAIL_AJAX, data={
-                    "parameters": parameters,
-                    "languages": settings["detail_langs"],
-                    "cmsv3": "true",
-                    "mappedWidgetSettings": settings["detail_mws"],
-                    "pageMode": "Live_Site",
-                    "website_type": "1",
-                    "website_id": "10065",
-                }, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                async with session.post(
+                    MEMBER_DETAIL_AJAX,
+                    data={
+                        "parameters": parameters,
+                        "languages": settings["detail_langs"],
+                        "cmsv3": "true",
+                        "mappedWidgetSettings": settings["detail_mws"],
+                        "pageMode": "Live_Site",
+                        "website_type": "1",
+                        "website_id": "10065",
+                    },
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status in (403, 429, 500):
+                        raise aiohttp.ClientResponseError(
+                            resp.request_info, resp.history,
+                            status=resp.status,
+                            message=f"HTTP {resp.status} on memberdetail for {member.get('member_name')}",
+                        )
                     html_content = await resp.text()
 
-                return parse_member_detail(html_content, member)
+                parsed = parse_member_detail_html(html_content)
+                member.update(parsed)
+                return member
 
+            except aiohttp.ClientResponseError:
+                raise
             except asyncio.TimeoutError:
                 if attempt < MAX_RETRIES:
                     await asyncio.sleep(0.3)
@@ -457,30 +552,94 @@ async def fetch_member_detail(session, member, settings, sem):
                 if attempt < MAX_RETRIES:
                     await asyncio.sleep(0.3)
                 else:
-                    logger.debug("會員 %s 詳情失敗: %s", member.get("member_name", "?"), e)
+                    logger.debug(
+                        "會員 %s 詳情失敗: %s", member.get("member_name", "?"), e
+                    )
 
     return member
 
 
-def save_members_csv(members, filename):
-    """儲存會員資料"""
-    if not members:
-        return
-    with open(filename, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
-        writer.writeheader()
-        for m in members:
-            writer.writerow({k: m.get(k, "") for k in CSV_FIELDS})
-    logger.info("已儲存 %d 筆至 %s", len(members), filename)
+# ─────────────────────────── Country scraper ─────────────────────────────────
 
 
-async def scrape_country(session, country_id, settings, concurrency):
-    """爬取一個國家的所有會員"""
+def _load_chapters_by_region(csv_path: str = "bni_chapters.csv") -> dict:
+    """
+    Load bni_chapters.csv and return {region_id: [{chapter_id, chapter_name, region_name}]}.
+    Returns empty dict if file not found.
+    """
+    import csv
+    p = Path(csv_path)
+    if not p.exists():
+        return {}
+    chapters_by_region: dict = {}
+    with p.open(encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            rid = str(row.get("region_id", "")).strip()
+            if not rid:
+                continue
+            chapters_by_region.setdefault(rid, []).append({
+                "chapter_id": str(row.get("chapter_id", "")).strip(),
+                "chapter_name": str(row.get("chapter_name", "")).strip(),
+                "region_name": str(row.get("region_name", "")).strip(),
+            })
+    return chapters_by_region
+
+
+async def fetch_members_for_chapter(
+    session: aiohttp.ClientSession,
+    country_id: int,
+    region_id: str,
+    region_name: str,
+    chapter: dict,
+    settings: dict,
+    sem: asyncio.Semaphore,
+) -> list:
+    """按分會 ID 抓取該分會所有會員"""
+    ch_id = chapter["chapter_id"]
+    ch_name = chapter["chapter_name"]
+    label = f"{region_name}/{ch_name}"
+
+    params = (
+        f"countryIds={country_id}&regionId={region_id}&chapterName={ch_id}"
+        f"&chapterArea=&memberKeywords=&chapterCity="
+        f"&memberFirstName=&memberLastName=&memberCompany="
+    )
+
+    async with sem:
+        html_text = await _ajax_memberlist(session, settings, params, label)
+
+    if len(html_text) < 100:
+        return []
+
+    return _parse_member_rows(
+        html_text, country_id, region_id, region_name,
+        chapter_id=ch_id, chapter_name_filter=ch_name,
+    )
+
+
+async def scrape_country(
+    session: aiohttp.ClientSession,
+    country_id: int,
+    concurrency: int,
+) -> list:
+    """
+    爬取一個國家的所有會員。
+
+    Widget settings are fetched **per country** so that the correct
+    ``mappedWidgetSettings`` is used for each country's pages.
+
+    策略：
+    - 若 bni_chapters.csv 有對應的分會資料 → 按分會逐一抓取（避免 API 截斷）
+    - 否則 → 按區域抓取（fallback）
+    """
     country_name = COUNTRIES.get(country_id, ("Unknown", 0))[0]
     logger.info("=" * 50)
     logger.info("開始爬取: %s (ID: %d)", country_name, country_id)
 
-    # 1. 取得區域列表
+    # Fetch widget settings specifically for this country
+    settings = await get_widget_settings(session, country_id)
+
+    # 1. Regions
     regions = await fetch_regions(session, country_id)
     if not regions:
         logger.warning("%s: 無區域資料", country_name)
@@ -488,30 +647,61 @@ async def scrape_country(session, country_id, settings, concurrency):
 
     logger.info("%s: %d 個區域", country_name, len(regions))
 
-    # 2. 並行取得所有區域的會員列表
-    sem = asyncio.Semaphore(concurrency)
-    tasks = [fetch_chapters_for_region(session, country_id, r, settings, sem) for r in regions]
+    # 2. Check for pre-loaded chapter data
+    chapters_by_region = _load_chapters_by_region()
 
-    all_members = []
-    regions_done = 0
-    regions_total = len(regions)
+    sem = asyncio.Semaphore(concurrency)
+
+    # Build task list: per-chapter if CSV available, per-region as fallback
+    tasks = []
+    task_labels = []  # for progress tracking
+    for r in regions:
+        rid = str(r["id"])
+        rname = r.get("name", rid)
+        pre_chapters = chapters_by_region.get(rid, [])
+        if pre_chapters:
+            for ch in pre_chapters:
+                tasks.append(
+                    fetch_members_for_chapter(session, country_id, rid, rname, ch, settings, sem)
+                )
+                task_labels.append(f"{rname}/{ch['chapter_name']}")
+        else:
+            tasks.append(fetch_chapters_for_region(session, country_id, r, settings, sem))
+            task_labels.append(rname)
+
+    total_tasks = len(tasks)
+    using_chapters = sum(
+        len(chapters_by_region.get(str(r["id"]), [])) for r in regions
+    )
+    if using_chapters:
+        logger.info("%s: 按分會抓取 (%d 個分會)", country_name, using_chapters)
+    else:
+        logger.info("%s: 按區域抓取 (無分會清單)", country_name)
+
+    all_members: list = []
+    done = 0
 
     for coro in asyncio.as_completed(tasks):
         members = await coro
         all_members.extend(members)
-        regions_done += 1
-        if regions_done % 10 == 0 or regions_done == regions_total:
-            logger.info("[%s] 區域進度: %d/%d (%d%%) - 累計 %d 位",
-                        country_name, regions_done, regions_total,
-                        int(regions_done / regions_total * 100),
-                        len(all_members))
+        done += 1
+        if done % 10 == 0 or done == total_tasks:
+            logger.info(
+                "[%s] 進度: %d/%d (%d%%) - 累計 %d 位",
+                country_name, done, total_tasks,
+                int(done / total_tasks * 100),
+                len(all_members),
+            )
 
     logger.info("[%s] 會員列表完成: %d 位", country_name, len(all_members))
 
-    # 3. 並行取得所有會員詳情
+    # 3. Parallel detail fetch, bounded by semaphore
     if all_members:
         detail_sem = asyncio.Semaphore(concurrency)
-        detail_tasks = [fetch_member_detail(session, m, settings, detail_sem) for m in all_members]
+        detail_tasks = [
+            fetch_member_detail(session, m, settings, detail_sem)
+            for m in all_members
+        ]
 
         details_done = 0
         details_total = len(detail_tasks)
@@ -520,22 +710,29 @@ async def scrape_country(session, country_id, settings, concurrency):
             await coro
             details_done += 1
             if details_done % 500 == 0 or details_done == details_total:
-                logger.info("[%s] 詳情進度: %d/%d (%d%%)",
-                            country_name, details_done, details_total,
-                            int(details_done / details_total * 100))
+                logger.info(
+                    "[%s] 詳情進度: %d/%d (%d%%)",
+                    country_name, details_done, details_total,
+                    int(details_done / details_total * 100),
+                )
 
     logger.info("[%s] 完成! %d 位會員", country_name, len(all_members))
     return all_members
 
 
-async def main():
-    # 授權驗證
-    from license_check import require_license
-    customer = require_license()
-    if customer:
-        print(f"  歡迎, {customer}!\n")
+# ─────────────────────────── Entry point ─────────────────────────────────────
 
-    concurrency = int(sys.argv[1]) if len(sys.argv) > 1 else 30
+
+async def main() -> None:
+    # 授權驗證（暫時停用，測試用）
+    # from license_check import require_license
+    # customer = require_license()
+    # if customer:
+    #     print(f"  歡迎, {customer}!\n")
+    pass
+
+    # Concurrency from CLI arg, falling back to config, then hardcoded default
+    concurrency = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_CONCURRENCY
 
     # 國家選擇選單
     selected_ids = show_country_menu()
@@ -548,31 +745,39 @@ async def main():
 
     start_time = time.time()
 
-    connector = aiohttp.TCPConnector(limit=concurrency, limit_per_host=concurrency, ttl_dns_cache=300)
+    connector = aiohttp.TCPConnector(
+        limit=concurrency,
+        limit_per_host=concurrency,
+        ttl_dns_cache=300,
+    )
     async with aiohttp.ClientSession(headers=HEADERS, connector=connector) as session:
-        # 取得 widget settings
-        settings = await get_widget_settings(session, selected_ids[0])
+        all_members: list = []
+        out_dir = Path(OUTPUT_DIR)
 
-        # 逐國爬取
-        all_members = []
         for country_id in selected_ids:
-            members = await scrape_country(session, country_id, settings, concurrency)
+            members = await scrape_country(session, country_id, concurrency)
             all_members.extend(members)
 
-            # 每個國家存一份
+            # Per-country output
             if members:
                 country_name = COUNTRIES[country_id][0].lower().replace(" ", "_")
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                save_members_csv(members, f"bni_members_{country_name}_{timestamp}.csv")
+                write_members_csv(
+                    out_dir / f"bni_members_{country_name}_{timestamp}.csv",
+                    members,
+                )
 
     elapsed = time.time() - start_time
 
-    # 全部存一份總檔
+    # Combined output when multiple countries were scraped
     if len(selected_ids) > 1 and all_members:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        save_members_csv(all_members, f"bni_members_all_{timestamp}.csv")
+        write_members_csv(
+            Path(OUTPUT_DIR) / f"bni_members_all_{timestamp}.csv",
+            all_members,
+        )
 
-    # 統計
+    # Summary
     print(f"\n{'=' * 60}")
     print(f"  爬取完成!")
     print(f"  國家: {', '.join(selected_names)}")

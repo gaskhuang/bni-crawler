@@ -1,14 +1,13 @@
 # ===== BNI 會員爬蟲設定檔 =====
 
-# 授權設定（由管理員提供）
-license:
-  api_url: ""    # Google Apps Script 部署 URL
-  key: ""        # 你的授權碼
-
-# 爬取設定
 scrape:
-  concurrency: 30      # 並行請求數（建議 20-50）
+  concurrency: 50       # 並行請求數（非同步版本用）
+  delay: 1.0            # 分會間等待秒數（同步/並行版本用）
+  retry_attempts: 3     # 失敗自動重試次數
 
-# 輸出設定
 output:
-  dir: "output"        # 輸出目錄
+  dir: output           # 輸出目錄
+  filename: bni_members.csv  # 最終輸出檔名
+
+license:
+  key: ""               # 授權碼（由管理員提供）
