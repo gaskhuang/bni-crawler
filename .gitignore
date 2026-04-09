@@ -38,3 +38,5 @@ test_*.py
 
 # Codex session
 codex-session-id
+.claude/
+bni_regions.csv
