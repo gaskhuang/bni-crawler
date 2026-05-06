@@ -1,24 +1,39 @@
 # BNI 全球會員爬蟲
 
-支援 44 個國家的 BNI 會員資料爬取，提供三種執行模式。
+[English](README.en.md) · 中文
+
+支援 44 個國家的 BNI 會員資料爬取，**純非同步 HTTP（Zero Selenium）**。
 
 ## 架構
 
-採用 Selenium + aiohttp 混合架構：
+`bni_scraper_async.py`（推薦使用）採用純 aiohttp 架構，完全不需要瀏覽器：
 
-1. **Selenium（headless Chrome）** — 動態發現各區域的分會清單（章節下拉選單為 JS 動態渲染）
-2. **aiohttp 非同步 HTTP** — 高併發抓取會員列表與詳細資料
+1. **區域列表**：呼叫 `appsCmsNationalChapterSearchFilterJson` 取得各國區域
+2. **分會發現**：呼叫 `appsCmsNationalMemberSearchFilterJson`（並行）取得各區域分會
+3. **會員列表**：呼叫 `bnicms/v3/frontend/memberlist/display`（每分會獨立查詢，避免 250 筆截斷）
+4. **會員詳情**：呼叫 `bnicms/v3/frontend/memberdetail/display`（並行）
 
-每次執行時自動從 BNI 網站即時發現所有分會，不依賴靜態資料檔。
+每次執行自動發現所有分會，不依賴靜態資料檔。
+
+## 為什麼按分會查詢
+
+BNI 公開 API 的會員列表 endpoint **每次最多回傳 250 筆**。台灣 31 個區域中有多達 13 個會員數超過 250，若按區域查詢會漏抓近 50% 的會員（4,420 vs 真實 9,662）。
+
+改成按分會（chapter）查詢後可拿到完整資料：
+
+| 查詢方式 | 台灣會員數 |
+|---------|-----------|
+| 按區域 | 4,420 ❌ |
+| **按分會** | **9,662 ✅** |
 
 ## 功能
 
 - 44 個國家的 BNI 會員資料爬取
 - 互動式國家選單（單選 / 多選 / 全選）
+- 純 aiohttp 並行抓取，無需 Selenium / Chrome
 - 動態分會發現（每次執行自動偵測最新分會）
-- 逐章節查詢，避免 API 200 筆上限截斷
-- 可調整併發數（預設 50）
 - 自動重試機制（預設 3 次）
+- 失敗 fallback：若某區域分會查詢失敗，退回 region 模式避免漏抓
 - CSV 輸出含公式注入防護
 
 ## 快速開始
@@ -28,30 +43,30 @@ pip install -r requirements.txt
 python bni_scraper_async.py
 ```
 
-啟動後會顯示國家選單，直接按 Enter 預設爬取台灣。
+啟動後顯示國家選單，直接按 Enter 預設爬取台灣，輸入編號（可逗號分隔）多選。
 
 ### 指定併發數
 
 ```bash
-python bni_scraper_async.py 100
+python bni_scraper_async.py 100   # 100 並發（預設讀 config.yaml 的 50）
 ```
 
-## 執行模式
+## 三種執行模式
 
-| 檔案 | 模式 | 說明 |
-|------|------|------|
-| `bni_scraper_async.py` | 非同步（推薦） | Selenium 發現分會 + aiohttp 高併發抓取，速度最快 |
-| `bni_scraper_parallel.py` | 多線程 | 多個 Chrome 實例並行，適合需要完整瀏覽器環境的場景 |
-| `bni_scraper.py` | 同步 | 單線程逐一抓取，最穩定但最慢 |
+| 檔案 | 模式 | 依賴 | 說明 |
+|------|------|------|------|
+| `bni_scraper_async.py` | 純非同步（**主力**） | aiohttp | 純 AJAX，速度最快，無需瀏覽器 |
+| `bni_scraper_parallel.py` | 多線程 | Selenium + Chrome | 多 Chrome 實例並行（舊版） |
+| `bni_scraper.py` | 同步 | Selenium + Chrome | 單線程逐一抓取（舊版，最穩定但最慢） |
 
 ## 專案結構
 
 ```
-bni_core.py              # 共用核心模組（driver 建立、HTML 解析、CSV 輸出）
-bni_scraper_async.py     # 非同步版爬蟲（主力）
-bni_scraper_parallel.py  # 多線程版爬蟲
-bni_scraper.py           # 同步版爬蟲
-config.yaml              # 設定檔（併發數、重試次數、輸出路徑）
+bni_core.py              # 共用核心模組（HTML 解析、CSV 輸出、Chrome driver factory）
+bni_scraper_async.py     # 非同步版（主力）
+bni_scraper_parallel.py  # 多線程版（舊）
+bni_scraper.py           # 同步版（舊）
+config.yaml              # 設定檔
 requirements.txt         # Python 依賴
 ```
 
@@ -59,7 +74,7 @@ requirements.txt         # Python 依賴
 
 ```yaml
 scrape:
-  concurrency: 50       # 並行請求數
+  concurrency: 50       # 並行請求數（建議 30–100）
   delay: 1.0            # 分會間等待秒數（同步版用）
   retry_attempts: 3     # 失敗自動重試次數
 
@@ -70,7 +85,7 @@ output:
 
 ## 輸出格式
 
-CSV 檔案，包含 24 個欄位：
+CSV，UTF-8 with BOM，包含 24 個欄位：
 
 | 欄位 | 說明 |
 |------|------|
@@ -94,20 +109,26 @@ CSV 檔案，包含 24 個欄位：
 | line_url | LINE 連結 |
 | detail_url | 詳情頁連結 |
 
-輸出檔名格式：`bni_members_{country}_{timestamp}.csv`
+輸出檔名：`output/bni_members_{country}_{timestamp}.csv`，多國時另外輸出 `bni_members_all_{timestamp}.csv`。
 
 ## 系統需求
 
 - Python 3.8+
-- Google Chrome（Selenium 自動管理 ChromeDriver）
+- `bni_scraper_async.py` 不需要 Chrome
+- `bni_scraper.py` / `bni_scraper_parallel.py` 需要 Google Chrome（Selenium 自動管理 ChromeDriver）
 
-## 效能參考（台灣）
+## 效能參考（台灣，31 區）
 
-| 項目 | 數值 |
-|------|------|
-| 區域數 | 31 |
-| 分會數 | ~257 |
-| 會員數 | ~9,800 |
-| 分會發現 | ~2 分鐘（Selenium） |
-| 會員抓取 + 詳情 | ~2 分鐘（concurrency=50） |
-| 總耗時 | ~4 分鐘 |
+| 階段 | 純 AJAX 版 | Selenium 版（舊） |
+|------|-----------|------------------|
+| 區域 → 分會發現 | **1.4 秒** | ~5 分鐘 |
+| 會員列表（254 個分會） | ~28 秒 | ~28 秒 |
+| 會員詳情（9,662 位） | ~2 分鐘 | ~2 分鐘 |
+| **總耗時** | **~2.6 分鐘** | ~9 分鐘 |
+| **會員回收率** | **9,662** | 9,647 |
+
+純 AJAX 版本在 chapter discovery 階段比 Selenium 版**快 225 倍**。
+
+## License
+
+請依專案實際授權使用，本工具僅抓取 BNI 公開網站上已公開揭露的會員資料。
