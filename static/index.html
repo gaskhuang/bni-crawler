@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>BNI 全球會員爬蟲</title>
+<style>
+  :root {
+    --fg: #1f2937;
+    --muted: #6b7280;
+    --bg: #f5f6f8;
+    --card: #ffffff;
+    --primary: #2563eb;
+    --primary-hover: #1d4ed8;
+    --border: #e5e7eb;
+    --success: #16a34a;
+    --error: #dc2626;
+    --warn: #d97706;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang TC",
+                 "Microsoft JhengHei", sans-serif;
+    color: var(--fg);
+    background: var(--bg);
+    margin: 0;
+    padding: 24px;
+    line-height: 1.5;
+  }
+  .container { max-width: 960px; margin: 0 auto; }
+  h1 { margin: 0 0 4px; font-size: 22px; }
+  .subtitle { color: var(--muted); margin-bottom: 20px; font-size: 14px; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+  .toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 14px;
+  }
+  .toolbar .left { display: flex; gap: 8px; align-items: center; }
+  button {
+    font: inherit;
+    padding: 8px 16px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: white;
+    cursor: pointer;
+  }
+  button:hover { background: #f9fafb; }
+  button.primary {
+    background: var(--primary);
+    color: white;
+    border-color: var(--primary);
+  }
+  button.primary:hover { background: var(--primary-hover); border-color: var(--primary-hover); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 6px 12px;
+  }
+  label.country {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  label.country:hover { background: #f3f4f6; }
+  label.country input { margin: 0; }
+  label.country .regions {
+    color: var(--muted);
+    font-size: 12px;
+    margin-left: auto;
+  }
+  .selection-summary {
+    color: var(--muted);
+    font-size: 13px;
+  }
+
+  .progress-bar {
+    height: 8px;
+    background: var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+    margin: 6px 0 8px;
+  }
+  .progress-bar > div {
+    height: 100%;
+    background: var(--primary);
+    width: 0%;
+    transition: width 0.3s ease;
+  }
+  .progress-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 13px;
+    color: var(--muted);
+    margin-top: 6px;
+  }
+  .stage {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 12px;
+    background: #eef2ff;
+    color: #4338ca;
+  }
+  .stage.done { background: #dcfce7; color: var(--success); }
+  .stage.error { background: #fee2e2; color: var(--error); }
+  .log {
+    margin-top: 10px;
+    background: #0f172a;
+    color: #cbd5e1;
+    border-radius: 8px;
+    padding: 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    max-height: 200px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+  }
+  .download {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 10px 16px;
+    background: var(--success);
+    color: white;
+    border-radius: 8px;
+    text-decoration: none;
+    font-weight: 500;
+  }
+  .download:hover { background: #15803d; }
+  .hidden { display: none !important; }
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 12px;
+    margin-top: 12px;
+  }
+  .stat {
+    background: #f9fafb;
+    border-radius: 8px;
+    padding: 10px 12px;
+  }
+  .stat .k { font-size: 12px; color: var(--muted); }
+  .stat .v { font-size: 18px; font-weight: 600; margin-top: 2px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>BNI 全球會員爬蟲</h1>
+  <div class="subtitle">勾選國家，按開始爬取。每次抓取的區域與分會皆即時取得。</div>
+
+  <div class="card">
+    <div class="toolbar">
+      <div class="left">
+        <button id="btn-all" type="button">全選</button>
+        <button id="btn-none" type="button">清除</button>
+        <button id="btn-default" type="button">預設 (台灣)</button>
+      </div>
+      <div class="selection-summary" id="summary">載入中⋯</div>
+    </div>
+    <div id="countries" class="grid"></div>
+    <div class="toolbar" style="margin-top: 16px; margin-bottom: 0;">
+      <div></div>
+      <button id="btn-start" class="primary" type="button">開始爬取</button>
+    </div>
+  </div>
+
+  <div id="job-card" class="card hidden">
+    <div class="toolbar" style="margin-bottom: 4px;">
+      <div>
+        <strong id="job-title">爬取中⋯</strong>
+        <span id="job-stage" class="stage" style="margin-left: 8px;">queued</span>
+      </div>
+      <a id="download-link" class="download hidden" href="#" download>⬇ 下載 CSV</a>
+    </div>
+
+    <div class="progress-bar"><div id="progress-fill"></div></div>
+    <div class="progress-row">
+      <span id="progress-text">準備中⋯</span>
+      <span id="progress-pct">0%</span>
+    </div>
+
+    <div class="stats" id="stats"></div>
+
+    <div class="log" id="log"></div>
+  </div>
+</div>
+
+<script>
+const STAGE_LABELS = {
+  queued: "排隊中",
+  widget_settings: "讀取設定",
+  regions: "取得區域",
+  chapter_discovery: "發現分會",
+  member_list: "抓取會員列表",
+  member_detail: "抓取會員詳情",
+  done: "完成",
+  error: "失敗",
+};
+const DEFAULT_ID = 7699;
+
+let countries = [];
+
+async function loadCountries() {
+  const r = await fetch("/api/countries");
+  const data = await r.json();
+  countries = data.countries;
+  const grid = document.getElementById("countries");
+  grid.innerHTML = countries.map(c => `
+    <label class="country">
+      <input type="checkbox" name="country" value="${c.id}" ${c.id === data.default_id ? "checked" : ""} />
+      <span>${c.name}</span>
+      <span class="regions">${c.region_count} 區</span>
+    </label>
+  `).join("");
+  grid.addEventListener("change", updateSummary);
+  updateSummary();
+}
+
+function selectedIds() {
+  return [...document.querySelectorAll('input[name="country"]:checked')]
+    .map(el => parseInt(el.value, 10));
+}
+
+function updateSummary() {
+  const ids = selectedIds();
+  const total = ids
+    .map(id => countries.find(c => c.id === id))
+    .filter(Boolean)
+    .reduce((a, c) => a + c.region_count, 0);
+  document.getElementById("summary").textContent =
+    `已選 ${ids.length} 國，共 ${total} 個區域`;
+  document.getElementById("btn-start").disabled = ids.length === 0;
+}
+
+document.getElementById("btn-all").onclick = () => {
+  document.querySelectorAll('input[name="country"]').forEach(el => el.checked = true);
+  updateSummary();
+};
+document.getElementById("btn-none").onclick = () => {
+  document.querySelectorAll('input[name="country"]').forEach(el => el.checked = false);
+  updateSummary();
+};
+document.getElementById("btn-default").onclick = () => {
+  document.querySelectorAll('input[name="country"]').forEach(el => el.checked = parseInt(el.value, 10) === DEFAULT_ID);
+  updateSummary();
+};
+
+document.getElementById("btn-start").onclick = async () => {
+  const ids = selectedIds();
+  if (!ids.length) return;
+  const startBtn = document.getElementById("btn-start");
+  startBtn.disabled = true;
+
+  const r = await fetch("/api/scrape", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ country_ids: ids }),
+  });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({ detail: r.statusText }));
+    alert("啟動失敗: " + err.detail);
+    startBtn.disabled = false;
+    return;
+  }
+  const { job_id } = await r.json();
+  showJob(job_id, ids);
+  pollJob(job_id, startBtn);
+};
+
+function showJob(jobId, ids) {
+  const card = document.getElementById("job-card");
+  card.classList.remove("hidden");
+  const names = ids.map(id => countries.find(c => c.id === id)?.name || id).join(", ");
+  document.getElementById("job-title").textContent = `爬取: ${names}`;
+  document.getElementById("download-link").classList.add("hidden");
+  document.getElementById("log").textContent = "";
+  document.getElementById("stats").innerHTML = "";
+  setProgress(0, "啟動中⋯");
+  setStage("queued");
+}
+
+function setStage(stage) {
+  const el = document.getElementById("job-stage");
+  el.textContent = STAGE_LABELS[stage] || stage;
+  el.classList.remove("done", "error");
+  if (stage === "done") el.classList.add("done");
+  if (stage === "error") el.classList.add("error");
+}
+
+function setProgress(pct, text) {
+  pct = Math.max(0, Math.min(100, pct));
+  document.getElementById("progress-fill").style.width = pct + "%";
+  document.getElementById("progress-pct").textContent = Math.round(pct) + "%";
+  if (text !== undefined) document.getElementById("progress-text").textContent = text;
+}
+
+function renderStats(job) {
+  const cells = [
+    ["目前國家", job.current_country || "—"],
+    ["區域", job.regions_total ? `${job.regions_total}` : "—"],
+    ["分會", job.chapters_total ? `${job.chapters_done}/${job.chapters_total}` : "—"],
+    ["會員數", (job.total_members || job.members_count || 0).toLocaleString()],
+    ["詳情", job.details_total ? `${job.details_done}/${job.details_total}` : "—"],
+  ];
+  if (job.elapsed) cells.push(["耗時", `${job.elapsed.toFixed(1)} 秒`]);
+  document.getElementById("stats").innerHTML = cells.map(([k, v]) =>
+    `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`
+  ).join("");
+}
+
+function progressFor(job) {
+  // Compose a single 0-100 number across the stages we know about.
+  switch (job.stage) {
+    case "queued":           return [2,  "排隊中"];
+    case "widget_settings":  return [5,  "讀取頁面設定"];
+    case "regions":          return [8,  "取得區域清單"];
+    case "chapter_discovery":return [12, "發現分會中"];
+    case "member_list": {
+      const pct = job.chapters_total ? 15 + (job.chapters_done / job.chapters_total) * 35 : 15;
+      return [pct, `會員列表 ${job.chapters_done}/${job.chapters_total} 分會`];
+    }
+    case "member_detail": {
+      const pct = job.details_total ? 50 + (job.details_done / job.details_total) * 50 : 50;
+      return [pct, `會員詳情 ${job.details_done}/${job.details_total}`];
+    }
+    case "done":  return [100, `完成，共 ${job.total_members.toLocaleString()} 位`];
+    case "error": return [100, "失敗: " + (job.error || "未知錯誤")];
+    default:      return [0, job.stage || ""];
+  }
+}
+
+async function pollJob(jobId, startBtn) {
+  const logEl = document.getElementById("log");
+  let lastLogLen = 0;
+  while (true) {
+    let job;
+    try {
+      const r = await fetch(`/api/jobs/${jobId}`);
+      job = await r.json();
+    } catch (e) {
+      await sleep(2000);
+      continue;
+    }
+
+    setStage(job.stage);
+    const [pct, text] = progressFor(job);
+    setProgress(pct, text);
+    renderStats(job);
+
+    if (job.log && job.log.length > lastLogLen) {
+      const newLines = job.log.slice(lastLogLen);
+      logEl.textContent += (logEl.textContent ? "\n" : "") + newLines.join("\n");
+      logEl.scrollTop = logEl.scrollHeight;
+      lastLogLen = job.log.length;
+    }
+
+    if (job.status === "done") {
+      const link = document.getElementById("download-link");
+      link.href = job.download_url;
+      link.classList.remove("hidden");
+      startBtn.disabled = false;
+      break;
+    }
+    if (job.status === "error") {
+      logEl.textContent += "\n[ERROR] " + (job.error || "");
+      startBtn.disabled = false;
+      break;
+    }
+    await sleep(1500);
+  }
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+loadCountries();
+</script>
+</body>
+</html>

@@ -1,0 +1,62 @@
+# Cloud Build will skip anything matching these patterns. Keep this small —
+# only ship what the runtime actually needs.
+
+# VCS
+.git
+.gitignore
+.gitattributes
+
+# Python virtual envs (huge — 200MB+)
+.venv
+venv
+env
+.env
+
+# Python bytecode
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+
+# Editors / OS
+.vscode
+.idea
+.DS_Store
+*.swp
+.claude
+
+# Scraped data / logs / caches (large and not needed in image)
+output
+*.csv
+*.log
+.license_cache.json
+ajax_*.html
+
+# Test scripts
+test_*.py
+
+# Legacy Selenium-based scrapers (not used on Cloud Run)
+bni_scraper.py
+bni_scraper_parallel.py
+license_check.py
+google_apps_script.js
+
+# Windows packaging
+build
+dist
+*.spec
+build_windows.bat
+build_windows.py
+
+# Docs (no need to bake into the image)
+README.md
+README.en.md
+
+# Reference data files
+bni_regions.csv
+bni_chapters.csv
+
+# Project metadata
+.gcp_project.txt

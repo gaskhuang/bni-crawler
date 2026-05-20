@@ -19,10 +19,10 @@ from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
+
+# Selenium / webdriver_manager are imported lazily inside the functions that
+# actually need them. This keeps the async (pure-aiohttp) execution path and
+# the Cloud Run container free of a hard dependency on Chrome.
 
 logger = logging.getLogger(__name__)
 
@@ -104,15 +104,21 @@ _chromedriver_path: Optional[str] = None
 
 
 def _get_chromedriver_path() -> str:
+    """Lazy import — only when the Selenium scrapers actually need a driver."""
+    from webdriver_manager.chrome import ChromeDriverManager  # noqa: WPS433
+
     global _chromedriver_path
     if _chromedriver_path is None:
         _chromedriver_path = ChromeDriverManager().install()
     return _chromedriver_path
 
 
-def create_driver(headless: bool = True) -> webdriver.Chrome:
+def create_driver(headless: bool = True):
     """
     Build and return a configured Chrome WebDriver instance.
+
+    Selenium is imported lazily here so the async (pure-aiohttp) scraper and
+    the Cloud Run container don't need Chrome at all to start up.
 
     Parameters
     ----------
@@ -121,10 +127,14 @@ def create_driver(headless: bool = True) -> webdriver.Chrome:
 
     Returns
     -------
-    webdriver.Chrome
+    selenium.webdriver.Chrome
         A ready-to-use driver with page_load_strategy='eager' and a 30-second
         page-load timeout.
     """
+    from selenium import webdriver  # noqa: WPS433
+    from selenium.webdriver.chrome.options import Options  # noqa: WPS433
+    from selenium.webdriver.chrome.service import Service  # noqa: WPS433
+
     options = Options()
     if headless:
         options.add_argument("--headless=new")
@@ -174,7 +184,7 @@ class AjaxClient:
     # Widget settings
     # ------------------------------------------------------------------
 
-    def get_widget_settings(self, driver: Optional[webdriver.Chrome] = None) -> str:
+    def get_widget_settings(self, driver: Optional[Any] = None) -> str:
         """
         Return the ``mappedWidgetSettings`` value required by AJAX endpoints.
 
