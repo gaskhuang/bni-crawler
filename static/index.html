@@ -365,6 +365,13 @@ async function pollJob(jobId, startBtn) {
     let job;
     try {
       const r = await fetch(`${API}/api/jobs/${jobId}`);
+      if (r.status === 404) {
+        setStage("error");
+        setProgress(100, "任務已不存在（伺服器重新啟動過），請重新爬取");
+        startBtn.disabled = false;
+        break;
+      }
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);  // 429 等暫時性錯誤：等一下再查
       job = await r.json();
     } catch (e) {
       await sleep(2000);
@@ -386,6 +393,7 @@ async function pollJob(jobId, startBtn) {
     if (job.status === "done") {
       const link = document.getElementById("download-link");
       link.href = API + job.download_url;
+      link.dataset.filename = job.csv_filename || "";
       link.classList.remove("hidden");
       startBtn.disabled = false;
       break;
@@ -400,6 +408,45 @@ async function pollJob(jobId, startBtn) {
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// 下載 CSV：用 fetch 取檔，伺服器忙（429 / 5xx）時自動重試，避免直接跳出 "Rate exceeded"。
+document.getElementById("download-link").addEventListener("click", async (ev) => {
+  ev.preventDefault();
+  const link = ev.currentTarget;
+  if (link.dataset.busy) return;
+  link.dataset.busy = "1";
+  const label = link.textContent;
+  try {
+    for (let attempt = 1; ; attempt++) {
+      link.textContent = attempt === 1 ? "下載中⋯" : `伺服器忙碌，重試中（${attempt}）⋯`;
+      let r;
+      try { r = await fetch(link.href); } catch (e) { r = null; }
+      if (r && r.ok) {
+        const blob = await r.blob();
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = link.dataset.filename || "bni_members.csv";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+        break;
+      }
+      if (r && r.status === 404) {
+        alert("找不到檔案，可能已過期（保留 7 天），請重新爬取。");
+        break;
+      }
+      if (attempt >= 10) {
+        alert("伺服器忙碌中，請稍後再按一次下載。");
+        break;
+      }
+      await sleep(Math.min(1000 * 2 ** (attempt - 1), 8000));
+    }
+  } finally {
+    link.textContent = label;
+    delete link.dataset.busy;
+  }
+});
 
 loadCountries();
 </script>
