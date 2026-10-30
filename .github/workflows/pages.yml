@@ -1,0 +1,46 @@
+# 把 static/ 的網頁介面發布到 GitHub Pages。
+# 爬蟲本身跑在 Cloud Run；網頁透過 repo 變數 BNI_API_BASE 指向它
+# （Settings → Secrets and variables → Actions → Variables）。
+name: Deploy web UI to GitHub Pages
+
+on:
+  push:
+    branches: [master]
+    paths: ["static/**", ".github/workflows/pages.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Point the UI at the Cloud Run backend
+        env:
+          BNI_API_BASE: ${{ vars.BNI_API_BASE }}
+        run: |
+          if [ -z "$BNI_API_BASE" ]; then
+            echo "::error::Repo variable BNI_API_BASE is not set (Cloud Run URL)"
+            exit 1
+          fi
+          printf 'window.BNI_API_BASE = "%s";\n' "$BNI_API_BASE" > static/config.js
+          cat static/config.js
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: static
+      - id: deployment
+        uses: actions/deploy-pages@v4

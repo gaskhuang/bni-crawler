@@ -26,13 +26,25 @@ BNI 公開 API 的會員列表 endpoint **每次最多回傳 250 筆**。台灣 
 | 按區域 | 4,420 ❌ |
 | **按分會** | **9,662 ✅** |
 
+## 2026-10 API 改版注意
+
+BNI 後端在 2026 年 5～10 月間改版，`memberlist/display` 與 `memberdetail/display`
+的 `languages` 參數不再接受 JSON 字串，必須照官網 jQuery 的方式送巢狀表單欄位
+（`languages[activeLanguage][id]=8`…），否則回傳 PHP Fatal error、抓到 0 位會員。
+`bni_scraper_async.py` 已改用 `_languages_form()` 處理。詳情頁也改成中文標籤
+（稱謂「先生/小姐」放在姓名前、電話附標籤），解析器改用 HTML 結構判斷欄位。
+
+> 舊版 `bni_scraper.py` / `bni_scraper_parallel.py` 仍使用 JSON 字串，目前無法使用。
+
 ## 功能
 
 - 44 個國家的 BNI 會員資料爬取
 - 互動式國家選單（單選 / 多選 / 全選）
 - 純 aiohttp 並行抓取，無需 Selenium / Chrome
 - 動態分會發現（每次執行自動偵測最新分會）
-- 自動重試機制（預設 3 次）
+- 自動重試機制（預設 3 次，429/5xx/逾時以指數退避重試，不會中斷整個國家）
+- 管線化抓取：每個分會的會員列表一回來就開始抓詳情
+- BNI 後端回錯誤頁（PHP Fatal error）時直接報錯，不會默默輸出空 CSV
 - 失敗 fallback：若某區域分會查詢失敗，退回 region 模式避免漏抓
 - CSV 輸出含公式注入防護
 
@@ -117,17 +129,18 @@ CSV，UTF-8 with BOM，包含 24 個欄位：
 - `bni_scraper_async.py` 不需要 Chrome
 - `bni_scraper.py` / `bni_scraper_parallel.py` 需要 Google Chrome（Selenium 自動管理 ChromeDriver）
 
-## 效能參考（台灣，31 區）
+## 效能參考（台灣，31 區，2026-10-30 實測）
 
-| 階段 | 純 AJAX 版 | Selenium 版（舊） |
-|------|-----------|------------------|
-| 區域 → 分會發現 | **1.4 秒** | ~5 分鐘 |
-| 會員列表（254 個分會） | ~28 秒 | ~28 秒 |
-| 會員詳情（9,662 位） | ~2 分鐘 | ~2 分鐘 |
-| **總耗時** | **~2.6 分鐘** | ~9 分鐘 |
-| **會員回收率** | **9,662** | 9,647 |
+| 階段 | 純 AJAX 版 |
+|------|-----------|
+| 區域 → 分會發現（252 個分會） | ~1 秒 |
+| 會員列表（與詳情管線化並行） | ~23 秒 |
+| 會員詳情（9,426 位） | ~80 秒 |
+| **總耗時** | **~1.8 分鐘**（併發 50） |
 
-純 AJAX 版本在 chapter discovery 階段比 Selenium 版**快 225 倍**。
+詳情頁約 100 次請求/秒，總耗時主要卡在詳情階段，可用 `python bni_scraper_async.py 100` 提高併發，但要留意 BNI 限流。
+
+舊版 Selenium 在分會發現階段約需 5 分鐘，AJAX 版快約 225 倍。
 
 ## License
 

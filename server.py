@@ -33,13 +33,9 @@ from bni_scraper_async import (
     COUNTRIES,
     DEFAULT_CONCURRENCY,
     HEADERS,
-    discover_all_chapters_ajax,
-    fetch_member_detail,
-    fetch_members_for_chapter,
-    fetch_regions,
-    get_widget_settings,
+    scrape_country,
 )
-from bni_core import MEMBER_FIELDS, write_members_csv
+from bni_core import write_members_csv
 
 logger = logging.getLogger("bni-server")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -110,76 +106,14 @@ class ScrapeRequest(BaseModel):
 # ── Scrape worker ────────────────────────────────────────────────────────────
 
 
-async def _scrape_country_tracked(
-    session: aiohttp.ClientSession,
-    country_id: int,
-    concurrency: int,
-    job: dict[str, Any],
-) -> list:
-    """
-    Variant of scrape_country() that pushes progress into ``job`` instead of
-    only logging. Keeps the scraper module clean of UI concerns.
-    """
-    country_name = COUNTRIES.get(country_id, ("Unknown", 0))[0]
-    job["current_country"] = country_name
-    job["stage"] = "widget_settings"
-
-    settings = await get_widget_settings(session, country_id)
-
-    job["stage"] = "regions"
-    regions = await fetch_regions(session, country_id)
-    if not regions:
-        job["log"].append(f"{country_name}: 無區域資料")
-        return []
-    job["regions_total"] = len(regions)
-
-    job["stage"] = "chapter_discovery"
-    all_chapters = await discover_all_chapters_ajax(
-        session, country_id, regions, concurrency=concurrency,
-    )
-    job["chapters_total"] = len(all_chapters)
-    job["log"].append(
-        f"{country_name}: {len(regions)} 個區域，發現 {len(all_chapters)} 個分會"
-    )
-
-    job["stage"] = "member_list"
-    sem = asyncio.Semaphore(concurrency)
-    tasks = [
-        fetch_members_for_chapter(
-            session, country_id,
-            ch["region_id"], ch["region_name"],
-            ch, settings, sem,
-        )
-        for ch in all_chapters
-    ]
-
-    all_members: list = []
-    done = 0
-    for coro in asyncio.as_completed(tasks):
-        members = await coro
-        all_members.extend(members)
-        done += 1
-        job["chapters_done"] = done
-        job["members_count"] = len(all_members)
-
-    job["log"].append(f"{country_name}: 會員列表 {len(all_members)} 位")
-
-    if all_members:
-        job["stage"] = "member_detail"
-        job["details_total"] = len(all_members)
-        detail_sem = asyncio.Semaphore(concurrency)
-        detail_tasks = [
-            fetch_member_detail(session, m, settings, detail_sem)
-            for m in all_members
-        ]
-        details_done = 0
-        for coro in asyncio.as_completed(detail_tasks):
-            await coro
-            details_done += 1
-            job["details_done"] = details_done
-
-    job["log"].append(f"{country_name}: 完成 {len(all_members)} 位")
-    return all_members
+def _job_progress(job: dict[str, Any]):
+    """把 scrape_country() 的進度回呼寫進 job dict；``log`` 會累加成清單。"""
+    def report(**fields: Any) -> None:
+        line = fields.pop("log", None)
+        if line:
+            job["log"].append(line)
+        job.update(fields)
+    return report
 
 
 async def _run_job(job_id: str, country_ids: list[int], concurrency: int) -> None:
@@ -194,8 +128,8 @@ async def _run_job(job_id: str, country_ids: list[int], concurrency: int) -> Non
         async with aiohttp.ClientSession(headers=HEADERS, connector=connector) as session:
             all_members: list = []
             for country_id in country_ids:
-                members = await _scrape_country_tracked(
-                    session, country_id, concurrency, job,
+                members = await scrape_country(
+                    session, country_id, concurrency, progress=_job_progress(job),
                 )
                 all_members.extend(members)
                 job["total_members"] = len(all_members)
@@ -220,11 +154,13 @@ async def _run_job(job_id: str, country_ids: list[int], concurrency: int) -> Non
         job["gcs_persisted"] = uploaded
 
         job["status"] = "done"
+        job["stage"] = "done"
         job["finished_at"] = time.time()
         job["elapsed"] = job["finished_at"] - job["started_at"]
     except Exception as exc:  # surface to UI rather than swallow
         logger.exception("Job %s failed", job_id)
         job["status"] = "error"
+        job["stage"] = "error"
         job["error"] = f"{type(exc).__name__}: {exc}"
         job["finished_at"] = time.time()
 

@@ -202,7 +202,11 @@
   </div>
 </div>
 
+<script src="config.js"></script>
 <script>
+// 後端網址：同站部署（Cloud Run 直接開）時為空字串；GitHub Pages 版由 config.js 指向 Cloud Run。
+const API = (window.BNI_API_BASE || "").replace(/\/$/, "");
+
 const STAGE_LABELS = {
   queued: "排隊中",
   widget_settings: "讀取設定",
@@ -218,8 +222,16 @@ const DEFAULT_ID = 7699;
 let countries = [];
 
 async function loadCountries() {
-  const r = await fetch("/api/countries");
-  const data = await r.json();
+  let data;
+  try {
+    const r = await fetch(`${API}/api/countries`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    data = await r.json();
+  } catch (e) {
+    document.getElementById("countries").innerHTML =
+      `<p style="color:var(--error)">無法連線到爬蟲後端（${e.message}），請稍後重新整理。</p>`;
+    return;
+  }
   countries = data.countries;
   const grid = document.getElementById("countries");
   grid.innerHTML = countries.map(c => `
@@ -268,7 +280,7 @@ document.getElementById("btn-start").onclick = async () => {
   const startBtn = document.getElementById("btn-start");
   startBtn.disabled = true;
 
-  const r = await fetch("/api/scrape", {
+  const r = await fetch(`${API}/api/scrape`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ country_ids: ids }),
@@ -352,7 +364,7 @@ async function pollJob(jobId, startBtn) {
   while (true) {
     let job;
     try {
-      const r = await fetch(`/api/jobs/${jobId}`);
+      const r = await fetch(`${API}/api/jobs/${jobId}`);
       job = await r.json();
     } catch (e) {
       await sleep(2000);
@@ -373,7 +385,7 @@ async function pollJob(jobId, startBtn) {
 
     if (job.status === "done") {
       const link = document.getElementById("download-link");
-      link.href = job.download_url;
+      link.href = API + job.download_url;
       link.classList.remove("hidden");
       startBtn.disabled = false;
       break;

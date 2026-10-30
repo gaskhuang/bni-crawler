@@ -60,8 +60,18 @@ SECTION_MARKERS: Dict[str, str] = {
     "Top Product": "best_product",
     "最佳產品": "best_product",
     "My Favorite BNI Story": "favorite_story",
+    "我最喜歡的BNI故事": "favorite_story",
     "Links": "__links__",  # sentinel so we know to stop
 }
+
+# Contact-detail labels (English + 繁中). Fax / freephone are ignored.
+PHONE_LABELS: Dict[str, set] = {
+    "phone": {"Phone", "電話", "Direct", "董事"},
+    "mobile": {"Mobile", "行動電話", "手機"},
+}
+
+# Salutation at the start of the name line (old English / current Chinese layout)
+SALUTATION_RE = re.compile(r"^(Dr\.|Mr\.|Ms\.|Mrs\.|Prof\.|博士|先生|小姐|女士|教授|醫師|律師)\s*")
 
 AJAX_LANGUAGES = json.dumps({
     "availableLanguages": [{
@@ -279,126 +289,141 @@ def _extract_mapped_widget_settings(html_text: str) -> str:
 # ─────────────────────────── Member-Detail Parser ────────────────────────────
 
 
+def make_soup(html_content: str) -> BeautifulSoup:
+    """BeautifulSoup with lxml when available (~5x faster), html.parser otherwise."""
+    try:
+        return BeautifulSoup(html_content, "lxml")
+    except Exception:  # lxml not installed
+        return BeautifulSoup(html_content, "html.parser")
+
+
+_POSTAL_ONLY = re.compile(r"^\d{3,6}$")
+_TRAILING_POSTAL = re.compile(r"^(.*\S)\s+(\d{3,6})$")
+
+
+def _lines(tag) -> List[str]:
+    """Visible text of *tag* split on <br>/newlines, blank lines removed."""
+    return [ln.strip() for ln in tag.get_text("\n").split("\n") if ln.strip()]
+
+
 def parse_member_detail_html(html_content: str) -> Dict[str, Any]:
     """
     Parse the HTML returned by the ``memberdetail/display`` AJAX endpoint.
 
-    Returns a dict with the fields that can be extracted from the HTML:
-    ``phone``, ``mobile``, ``title``, ``address``, ``postal_code``,
-    ``website``, ``industry``, ``business_desc``, ``ideal_referral``,
-    ``best_product``, ``top_problem_solved``, ``ideal_referral_partner``,
-    ``favorite_story``, ``line_url``.
+    Works off the page's HTML structure (CSS classes) rather than the position
+    of text lines, so it handles both the old English labels and the current
+    localized layout (中文稱謂在姓名前、電話有標籤、區塊標題為中文).
 
-    Only keys whose values were actually found are included; callers should
-    merge the result with the base member dict (``member.update(parsed)``).
+    Returns only the keys that were found: ``phone``, ``mobile``, ``title``,
+    ``address``, ``postal_code``, ``website``, ``industry``, ``business_desc``,
+    ``ideal_referral``, ``best_product``, ``top_problem_solved``,
+    ``ideal_referral_partner``, ``favorite_story``, ``line_url``.
     """
     result: Dict[str, Any] = {}
-
     if not html_content or len(html_content) < 50:
         return result
 
-    soup = BeautifulSoup(html_content, "html.parser")
+    soup = make_soup(html_content)
+    for junk in soup(["script", "style"]):
+        junk.decompose()
 
-    # ── Phone / mobile ──────────────────────────────────────────────
-    tel_links = soup.find_all("a", href=re.compile(r"^tel:"))
-    phones = list(dict.fromkeys(
-        a.get_text(strip=True) for a in tel_links if a.get_text(strip=True)
-    ))
-    if phones:
-        result["phone"] = phones[0]
-    if len(phones) > 1:
-        result["mobile"] = phones[1]
+    # ── Top card: name / company / industry ─────────────────────────
+    info = soup.select_one(".memberProfileInfo")
+    name = company = ""
+    if info:
+        h2 = info.find("h2")
+        name = h2.get_text(strip=True) if h2 else ""
+        p = info.find("p")
+        company = p.get_text(strip=True) if p else ""
+        h6 = info.find("h6")
+        if h6 and h6.get_text(strip=True):
+            result["industry"] = h6.get_text(strip=True)
 
-    # ── Section split ────────────────────────────────────────────────
-    body_text = soup.get_text(separator="\n")
-    lines = [ln.strip() for ln in body_text.split("\n") if ln.strip()]
-
-    sections: Dict[str, List[str]] = {}
-    current_section = "header"
-    section_lines: List[str] = []
-
-    for line in lines:
-        if line in SECTION_MARKERS:
-            if section_lines:
-                sections[current_section] = section_lines
-            current_section = line
-            section_lines = []
-        else:
-            section_lines.append(line)
-    if section_lines:
-        sections[current_section] = section_lines
-
-    # ── Header: title / address / postal_code / website / industry ──
-    header = sections.get("header", [])
-
-    # Try to locate the "Chapter" anchor
-    chapter_idx = -1
-    for i, line in enumerate(header):
-        if line == "Chapter":
-            chapter_idx = i
-            break
-
-    if chapter_idx >= 0:
-        # Industry is at index 2 (before "Chapter")
-        if chapter_idx >= 3:
-            result["industry"] = header[2]
-
-        after_chapter = header[chapter_idx + 1:]
-        if after_chapter:
-            after_chapter = after_chapter[1:]  # skip chapter name
-
-        # Find salutation line
-        title_idx = -1
-        for i, line in enumerate(after_chapter):
-            if re.match(r"^(Dr\.|Mr\.|Ms\.|Mrs\.|博士|先生|小姐|女士)", line):
-                title_idx = i
-                result["title"] = line
-                break
-
-        if title_idx >= 0:
-            info = after_chapter[title_idx + 1:]
-            addr_lines = info[1:] if len(info) > 1 else []
-            addr_parts: List[str] = []
-            for line in addr_lines:
-                if re.match(r"^https?://|^www\.", line):
-                    result["website"] = line
-                    break
-                if re.match(r"^\d{3,5}$", line):
-                    result["postal_code"] = line
-                    continue
-                if line and not line.startswith(("BNI", "Links")):
-                    addr_parts.append(line)
-            if addr_parts:
-                result["address"] = " ".join(addr_parts)
-    else:
-        # Fallback for pages without "Chapter" anchor (older layout)
-        info_start = 0
-        for i, line in enumerate(header):
-            if line.startswith(("Mr.", "Ms.", "Mrs.", "先生", "小姐", "女士")):
-                info_start = i + 1
-                break
-
-        if info_start > 0 and info_start < len(header):
-            remaining = header[info_start:]
-            addr_parts = []
-            for line in remaining[1:]:  # skip duplicate company name
-                if re.match(r"^https?://|^www\.", line):
-                    result["website"] = line
-                    break
-                if re.match(r"^\d{3,5}$", line):
-                    continue
-                if line and not line.startswith(("BNI", "Links")):
-                    addr_parts.append(line)
-            if addr_parts:
-                result["address"] = " ".join(addr_parts)
-
-    # ── Sections ────────────────────────────────────────────────────
-    for marker, field in SECTION_MARKERS.items():
-        if field == "__links__":
+    # ── Phones: labelled <li><strong>電話</strong><a href=tel:..> ─────
+    phones: List[str] = []
+    for li in soup.select(".memberContactDetails li"):
+        a = li.find("a", href=re.compile(r"^tel:"))
+        if not a or not a.get_text(strip=True):
             continue
-        content = sections.get(marker, [])
-        if content and field not in result:
-            result[field] = "\n".join(content)
+        number = a.get_text(strip=True)
+        strong = li.find("strong")
+        label = strong.get_text(strip=True) if strong else ""
+        if label in PHONE_LABELS["mobile"]:
+            result.setdefault("mobile", number)
+        elif label in PHONE_LABELS["phone"]:
+            result.setdefault("phone", number)
+        elif not label:
+            phones.append(number)  # unlabelled (older layout) → positional
+    if not phones and "phone" not in result and "mobile" not in result:
+        # Last resort: any tel: link on the page
+        phones = [a.get_text(strip=True) for a in soup.find_all("a", href=re.compile(r"^tel:"))
+                  if a.get_text(strip=True)]
+    phones = [p for p in dict.fromkeys(phones)
+              if p not in (result.get("phone"), result.get("mobile"))]
+    if phones and "phone" not in result:
+        result["phone"] = phones.pop(0)
+    if phones and "mobile" not in result:
+        result["mobile"] = phones.pop(0)
+
+    # ── Company card: 稱謂+姓名 / 公司 / 地址… / 郵遞區號, website ─────
+    holder = soup.select_one(".widgetMemberCompanyDetail .textHolder")
+    if holder:
+        h6 = holder.find("h6")
+        lines = _lines(h6) if h6 else []
+        if lines:
+            first = lines[0]
+            if name and name in first:
+                title = first.replace(name, "").strip()
+                if title:
+                    result["title"] = title
+                lines = lines[1:]
+            elif SALUTATION_RE.match(first):
+                result["title"] = SALUTATION_RE.match(first).group(0).strip()
+                lines = lines[1:]
+        if lines and company and lines[0] == company:
+            lines = lines[1:]
+
+        addr_parts: List[str] = []
+        for ln in lines:
+            if re.fullmatch(r"\d{1,2}", ln):
+                continue  # 佔位用的 "0" 之類
+            if _POSTAL_ONLY.match(ln):
+                result.setdefault("postal_code", ln)
+                continue
+            m = _TRAILING_POSTAL.match(ln)
+            if m:
+                addr_parts.append(m.group(1))
+                result.setdefault("postal_code", m.group(2))
+                continue
+            addr_parts.append(ln)
+        if addr_parts:
+            result["address"] = " ".join(addr_parts)
+
+        site = holder.select_one("p a[href]")
+        if site:
+            result["website"] = site["href"].strip() or site.get_text(strip=True)
+    if "website" not in result and info:
+        a = info.select_one("p a[href^=http]")
+        if a:
+            result["website"] = a["href"]
+
+    # ── Text sections (h2/h3 heading → following text) ──────────────
+    sections: Dict[str, List[str]] = {}
+    for sec in soup.select("section.widgetMemberTxtVideo, section.widgetProfile"):
+        current: Optional[str] = None
+        for node in sec.find_all(string=True):
+            text = node.strip()
+            if not text:
+                continue
+            if node.parent.name in ("h2", "h3"):
+                current = SECTION_MARKERS.get(text)
+                if current is None:
+                    logger.debug("未知的詳情區塊標題: %s", text)
+                continue
+            if current and current != "__links__":
+                sections.setdefault(current, []).append(text)
+    for field, content in sections.items():
+        result[field] = "\n".join(content)
 
     # ── LINE URL ────────────────────────────────────────────────────
     line_urls = re.findall(r'https?://line\.me/[^\s"\'<>]+', html_content)

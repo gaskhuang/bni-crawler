@@ -7,12 +7,13 @@ BNI 全球會員資料爬蟲 - 極致優化版 (Zero Selenium, Pure Async)
 
 支援 44 個國家，啟動時顯示文字選單選擇國家。
 
-用法: python bni_scraper_async.py [並行數，預設5]
+用法: python bni_scraper_async.py [並行數，預設讀 config.yaml]
 """
 
 import asyncio
-import html as html_mod
+import json
 import logging
+import random
 import re
 import sys
 import time
@@ -21,16 +22,14 @@ from pathlib import Path
 
 import aiohttp
 import yaml
-from bs4 import BeautifulSoup
 
 from bni_core import (
     BASE_URL,
     MEMBER_FIELDS,
-    MEMBER_LIST_URL,
     MEMBERLIST_AJAX,
     MEMBER_DETAIL_AJAX,
     MEMBER_DETAIL_URL,
-    append_members_csv,
+    make_soup,
     parse_member_detail_html,
     write_members_csv,
     _extract_mapped_widget_settings,
@@ -129,6 +128,48 @@ HEADERS = {
     ),
 }
 
+# BNI 後端 (2026 改版後) 只接受 jQuery 風格的巢狀表單欄位：
+# languages[activeLanguage][id]=8 ... 傳 JSON 字串會讓 PHP 直接 Fatal error。
+PHP_FATAL_MARKER = "<b>Fatal error</b>"
+
+
+def _flatten_form(obj, prefix: str) -> list:
+    """把 dict/list 展開成 jQuery $.param 的巢狀表單欄位 [(key, value), ...]。"""
+    if isinstance(obj, dict):
+        return [kv for k, v in obj.items() for kv in _flatten_form(v, f"{prefix}[{k}]")]
+    if isinstance(obj, list):
+        return [kv for i, v in enumerate(obj) for kv in _flatten_form(v, f"{prefix}[{i}]")]
+    if obj is None:
+        return [(prefix, "")]
+    if isinstance(obj, bool):
+        return [(prefix, "true" if obj else "false")]
+    return [(prefix, str(obj))]
+
+
+def _languages_form(langs_json: str) -> list:
+    """把頁面上的 `var languages = {...}` JSON 轉成巢狀表單欄位。"""
+    if not langs_json:
+        return []
+    try:
+        return _flatten_form(json.loads(langs_json), "languages")
+    except ValueError:
+        logger.warning("languages JSON 解析失敗，改用原字串送出")
+        return [("languages", langs_json)]
+
+
+def _cms_form(parameters: str, langs_form: list, mws: str) -> list:
+    """組出 memberlist / memberdetail display endpoint 共用的表單內容。"""
+    return [
+        ("parameters", parameters),
+        *langs_form,
+        ("cmsv3", "true"),
+        ("mappedWidgetSettings", mws),
+        ("pageMode", "Live_Site"),
+        ("website_type", "1"),
+        ("website_id", "10065"),
+    ]
+
+
 # ─────────────────────────── Country menu ────────────────────────────────────
 
 
@@ -213,7 +254,7 @@ async def get_widget_settings(session: aiohttp.ClientSession, country_id: int) -
                         status=resp.status,
                         message=f"Unexpected status {resp.status} fetching memberlist page",
                     )
-                text = await resp.text()
+                text = await resp.text(errors="replace")
 
             mws = ""
             m = re.search(r"var mappedWidgetSettings = '(\[.*?\])';", text)
@@ -235,7 +276,7 @@ async def get_widget_settings(session: aiohttp.ClientSession, country_id: int) -
                         status=resp2.status,
                         message=f"Unexpected status {resp2.status} fetching memberdetail page",
                     )
-                text2 = await resp2.text()
+                text2 = await resp2.text(errors="replace")
 
             detail_mws = _extract_mapped_widget_settings(text2)
 
@@ -263,6 +304,8 @@ async def get_widget_settings(session: aiohttp.ClientSession, country_id: int) -
                 "list_langs": langs,
                 "detail_mws": detail_mws,
                 "detail_langs": detail_langs,
+                "list_langs_form": _languages_form(langs),
+                "detail_langs_form": _languages_form(detail_langs),
             }
         except aiohttp.ClientResponseError:
             raise
@@ -393,64 +436,53 @@ async def discover_all_chapters_ajax(
     return all_chapters
 
 
-async def _ajax_memberlist(
+class BniApiError(RuntimeError):
+    """BNI 後端回傳無法處理的格式（例如 PHP Fatal error）——通常代表 API 又改版了。"""
+
+
+# 這些狀態碼通常是暫時性的（限流、伺服器忙），退避後重試即可。
+RETRY_STATUSES = {403, 408, 425, 429, 500, 502, 503, 504}
+
+
+async def _post_cms_html(
     session: aiohttp.ClientSession,
-    settings: dict,
-    params_str: str,
+    url: str,
+    form: list,
     label: str,
+    timeout: float,
 ) -> str:
-    """POST to MEMBERLIST_AJAX and return the HTML text. Raises on HTTP errors."""
+    """
+    POST 到 BNI CMS display endpoint 並回傳 HTML。
+
+    - 暫時性錯誤（逾時、連線失敗、429/5xx）以指數退避重試，不會中斷整個國家。
+    - 後端回 PHP Fatal error 時丟 BniApiError，讓呼叫端決定要不要中止。
+    - 重試用盡回傳空字串。
+    """
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             async with session.post(
-                MEMBERLIST_AJAX,
-                data={
-                    "parameters": params_str,
-                    "languages": settings["list_langs"],
-                    "cmsv3": "true",
-                    "mappedWidgetSettings": settings["list_mws"],
-                    "pageMode": "Live_Site",
-                    "website_type": "1",
-                    "website_id": "10065",
-                },
-                timeout=aiohttp.ClientTimeout(total=30),
+                url, data=form, timeout=aiohttp.ClientTimeout(total=timeout),
             ) as resp:
-                if resp.status in (403, 429, 500):
+                text = await resp.text(errors="replace")
+                if resp.status in RETRY_STATUSES:
                     raise aiohttp.ClientResponseError(
                         resp.request_info, resp.history,
-                        status=resp.status,
-                        message=f"HTTP {resp.status} on memberlist for {label}",
+                        status=resp.status, message=f"HTTP {resp.status}",
                     )
-                return await resp.text()
-        except aiohttp.ClientResponseError:
+            if PHP_FATAL_MARKER in text[:1000]:
+                raise BniApiError(
+                    f"{label}: BNI 後端回傳 PHP Fatal error，API 參數格式可能又改版了。"
+                    f" 回應開頭: {text[:300]!r}"
+                )
+            return text
+        except BniApiError:
             raise
-        except asyncio.TimeoutError:
-            logger.warning("%s 超時 (attempt %d)", label, attempt)
-            if attempt < MAX_RETRIES:
-                await asyncio.sleep(1)
-        except Exception as e:
-            logger.warning("%s 失敗 (attempt %d): %s", label, attempt, e)
-            if attempt < MAX_RETRIES:
-                await asyncio.sleep(0.5)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            if attempt >= MAX_RETRIES:
+                logger.warning("%s 失敗（已重試 %d 次）: %r", label, attempt, exc)
+                break
+            await asyncio.sleep(min(0.5 * 2 ** attempt, 8) + random.random() * 0.5)
     return ""
-
-
-def _parse_chapter_options(html_text: str) -> list:
-    """
-    Extract chapter IDs and names from the chapterName <select> dropdown.
-    Returns list of {chapter_id, chapter_name} dicts. Empty if no dropdown found.
-    """
-    soup = BeautifulSoup(html_text, "html.parser")
-    sel = soup.find("select", {"name": "chapterName"})
-    if not sel:
-        return []
-    chapters = []
-    for opt in sel.find_all("option"):
-        val = opt.get("value", "").strip()
-        text = opt.get_text(strip=True)
-        if val and val != "0":
-            chapters.append({"chapter_id": val, "chapter_name": text})
-    return chapters
 
 
 def _parse_member_rows(
@@ -462,7 +494,7 @@ def _parse_member_rows(
     chapter_name_filter: str = "",
 ) -> list:
     """Parse member rows from memberlist HTML and return member dicts."""
-    soup = BeautifulSoup(html_text, "html.parser")
+    soup = make_soup(html_text)
     rows = soup.select("table tbody tr")
     members = []
     country_name = COUNTRIES.get(country_id, ("?", 0))[0]
@@ -509,73 +541,7 @@ def _parse_member_rows(
     return members
 
 
-
-
-# ─────────────────────────── Member detail ───────────────────────────────────
-
-
-async def fetch_member_detail(
-    session: aiohttp.ClientSession,
-    member: dict,
-    settings: dict,
-    sem: asyncio.Semaphore,
-) -> dict:
-    """用 AJAX 取得單一會員詳情"""
-    detail_url = member.get("detail_url", "")
-    if not detail_url:
-        return member
-
-    if "?" in detail_url:
-        parameters = detail_url.split("?", 1)[1]
-    else:
-        return member
-
-    async with sem:
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                async with session.post(
-                    MEMBER_DETAIL_AJAX,
-                    data={
-                        "parameters": parameters,
-                        "languages": settings["detail_langs"],
-                        "cmsv3": "true",
-                        "mappedWidgetSettings": settings["detail_mws"],
-                        "pageMode": "Live_Site",
-                        "website_type": "1",
-                        "website_id": "10065",
-                    },
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as resp:
-                    if resp.status in (403, 429, 500):
-                        raise aiohttp.ClientResponseError(
-                            resp.request_info, resp.history,
-                            status=resp.status,
-                            message=f"HTTP {resp.status} on memberdetail for {member.get('member_name')}",
-                        )
-                    html_content = await resp.text()
-
-                parsed = parse_member_detail_html(html_content)
-                member.update(parsed)
-                return member
-
-            except aiohttp.ClientResponseError:
-                raise
-            except asyncio.TimeoutError:
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(0.3)
-            except Exception as e:
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(0.3)
-                else:
-                    logger.debug(
-                        "會員 %s 詳情失敗: %s", member.get("member_name", "?"), e
-                    )
-
-    return member
-
-
-# ─────────────────────────── Country scraper ─────────────────────────────────
-
+# ─────────────────────────── Member list / detail ────────────────────────────
 
 
 async def fetch_members_for_chapter(
@@ -587,7 +553,7 @@ async def fetch_members_for_chapter(
     settings: dict,
     sem: asyncio.Semaphore,
 ) -> list:
-    """按分會 ID 抓取該分會所有會員"""
+    """按分會 ID 抓取該分會所有會員（列表頁欄位，不含詳情）。"""
     ch_id = chapter["chapter_id"]
     ch_name = chapter["chapter_name"]
     label = f"{region_name}/{ch_name}"
@@ -599,7 +565,11 @@ async def fetch_members_for_chapter(
     )
 
     async with sem:
-        html_text = await _ajax_memberlist(session, settings, params, label)
+        html_text = await _post_cms_html(
+            session, MEMBERLIST_AJAX,
+            _cms_form(params, settings["list_langs_form"], settings["list_mws"]),
+            label, timeout=30,
+        )
 
     if len(html_text) < 100:
         return []
@@ -610,97 +580,156 @@ async def fetch_members_for_chapter(
     )
 
 
+async def fetch_member_detail(
+    session: aiohttp.ClientSession,
+    member: dict,
+    settings: dict,
+    sem: asyncio.Semaphore,
+) -> dict:
+    """
+    用 AJAX 取得單一會員詳情，就地補進 *member*。
+
+    詳情頁只用來「補空欄位」：列表頁的產業分類（例如「零售 > 定制服裝 > …」）
+    比詳情頁的「定制服裝 | 定制服裝」完整，不能被覆蓋。
+    BNI 回 PHP Fatal error 時會丟 BniApiError。
+    """
+    detail_url = member.get("detail_url", "")
+    if "?" not in detail_url:
+        return member
+    parameters = detail_url.split("?", 1)[1]
+
+    async with sem:
+        html_content = await _post_cms_html(
+            session, MEMBER_DETAIL_AJAX,
+            _cms_form(parameters, settings["detail_langs_form"], settings["detail_mws"]),
+            f"詳情 {member.get('member_name', '?')}", timeout=20,
+        )
+
+    for key, value in parse_member_detail_html(html_content).items():
+        if value and not member.get(key):
+            member[key] = value
+    return member
+
+
+# ─────────────────────────── Country scraper ─────────────────────────────────
+
+
+def _member_key(m: dict) -> tuple:
+    return (m.get("detail_url") or "", m.get("chapter_id"), m.get("member_name"))
+
+
 async def scrape_country(
     session: aiohttp.ClientSession,
     country_id: int,
     concurrency: int,
+    progress=None,
 ) -> list:
     """
     爬取一個國家的所有會員。
 
-    Widget settings are fetched **per country** so that the correct
-    ``mappedWidgetSettings`` is used for each country's pages.
-
     流程：
-    1. 取得區域列表
-    2. 動態發現每個區域的分會（GET memberlist 頁面解析 dropdown）
-    3. 對每個分會呼叫 AJAX 取得會員（避免 API ~200 筆截斷）
-    4. 抓每位會員的詳情
+    1. 取得該國的 widget settings（每國不同）與區域列表
+    2. 並行發現每個區域的分會
+    3. 管線化：每個分會的會員列表一回來，就立刻開始抓那批會員的詳情，
+       不必等所有分會列表都跑完（列表與詳情共用同一個併發上限）
+    4. 依「區域 → 分會 → 姓名」排序後回傳，輸出 CSV 順序穩定
+
+    *progress*：選填的回呼 ``progress(**fields)``，Web UI 用來更新進度；
+    欄位名稱與 server.py 的 job dict 相同。
     """
+    report = progress or (lambda **_: None)
     country_name = COUNTRIES.get(country_id, ("Unknown", 0))[0]
     logger.info("=" * 50)
     logger.info("開始爬取: %s (ID: %d)", country_name, country_id)
+    report(current_country=country_name, stage="widget_settings")
 
-    # Fetch widget settings specifically for this country
     settings = await get_widget_settings(session, country_id)
 
-    # 1. Regions
+    report(stage="regions")
     regions = await fetch_regions(session, country_id)
     if not regions:
         logger.warning("%s: 無區域資料", country_name)
+        report(log=f"{country_name}: 無區域資料")
         return []
+    report(regions_total=len(regions), stage="chapter_discovery")
 
-    logger.info("%s: %d 個區域，透過 AJAX 並行發現分會...", country_name, len(regions))
-
-    # 2. Discover chapters via AJAX (appsCmsNationalMemberSearchFilterJson)
     all_chapters = await discover_all_chapters_ajax(
         session, country_id, regions, concurrency=concurrency,
     )
     total_chapters = len(all_chapters)
-    logger.info("%s: 發現 %d 個分會", country_name, total_chapters)
+    logger.info("%s: %d 個區域，%d 個分會", country_name, len(regions), total_chapters)
+    report(
+        chapters_total=total_chapters, stage="member_list",
+        log=f"{country_name}: {len(regions)} 個區域，發現 {total_chapters} 個分會",
+    )
 
     sem = asyncio.Semaphore(concurrency)
-
-    # 3. Build member-fetch tasks (one per chapter)
-    tasks = [
-        fetch_members_for_chapter(
-            session, country_id,
-            ch["region_id"], ch["region_name"],
-            ch, settings, sem,
-        )
-        for ch in all_chapters
-    ]
-    total_tasks = len(tasks)
-
     all_members: list = []
-    done = 0
+    seen: set = set()
+    counts = {"chapters": 0, "details": 0, "details_total": 0, "detail_errors": 0}
 
-    for coro in asyncio.as_completed(tasks):
-        members = await coro
-        all_members.extend(members)
-        done += 1
-        if done % 10 == 0 or done == total_tasks:
+    async def detail_one(member: dict) -> None:
+        try:
+            await fetch_member_detail(session, member, settings, sem)
+        except BniApiError:
+            raise
+        except Exception:  # 單一會員的怪資料不該拖垮整個國家
+            counts["detail_errors"] += 1
+            logger.warning(
+                "會員 %s 詳情解析失敗，保留列表欄位", member.get("member_name", "?"),
+                exc_info=counts["detail_errors"] <= 3,
+            )
+        counts["details"] += 1
+        report(details_done=counts["details"])
+        if counts["details"] % 500 == 0:
             logger.info(
-                "[%s] 進度: %d/%d (%d%%) - 累計 %d 位",
-                country_name, done, total_tasks,
-                int(done / total_tasks * 100),
-                len(all_members),
+                "[%s] 詳情進度: %d/%d（分會 %d/%d）",
+                country_name, counts["details"], counts["details_total"],
+                counts["chapters"], total_chapters,
             )
 
-    logger.info("[%s] 會員列表完成: %d 位", country_name, len(all_members))
+    async def process_chapter(ch: dict) -> None:
+        members = await fetch_members_for_chapter(
+            session, country_id, ch["region_id"], ch["region_name"], ch, settings, sem,
+        )
+        fresh = []
+        for m in members:
+            key = _member_key(m)
+            if key not in seen:
+                seen.add(key)
+                fresh.append(m)
+        all_members.extend(fresh)
+        counts["chapters"] += 1
+        counts["details_total"] += len(fresh)
+        report(
+            chapters_done=counts["chapters"],
+            members_count=len(all_members),
+            details_total=counts["details_total"],
+        )
+        if counts["chapters"] == total_chapters:
+            logger.info("[%s] 會員列表完成: %d 位", country_name, len(all_members))
+            report(
+                stage="member_detail",
+                log=f"{country_name}: 會員列表 {len(all_members)} 位",
+            )
+        await asyncio.gather(*(detail_one(m) for m in fresh))
 
-    # 3. Parallel detail fetch, bounded by semaphore
-    if all_members:
-        detail_sem = asyncio.Semaphore(concurrency)
-        detail_tasks = [
-            fetch_member_detail(session, m, settings, detail_sem)
-            for m in all_members
-        ]
+    await asyncio.gather(*(process_chapter(ch) for ch in all_chapters))
 
-        details_done = 0
-        details_total = len(detail_tasks)
+    if not all_members:
+        logger.warning(
+            "[%s] %d 個分會卻抓到 0 位會員——請確認 BNI 網站是否改版",
+            country_name, total_chapters,
+        )
 
-        for coro in asyncio.as_completed(detail_tasks):
-            await coro
-            details_done += 1
-            if details_done % 500 == 0 or details_done == details_total:
-                logger.info(
-                    "[%s] 詳情進度: %d/%d (%d%%)",
-                    country_name, details_done, details_total,
-                    int(details_done / details_total * 100),
-                )
+    if counts["detail_errors"]:
+        logger.warning("[%s] %d 位會員詳情失敗", country_name, counts["detail_errors"])
 
+    all_members.sort(key=lambda m: (
+        m.get("region_name", ""), m.get("chapter_name", ""), m.get("member_name", ""),
+    ))
     logger.info("[%s] 完成! %d 位會員", country_name, len(all_members))
+    report(log=f"{country_name}: 完成 {len(all_members)} 位")
     return all_members
 
 
@@ -708,13 +737,6 @@ async def scrape_country(
 
 
 async def main() -> None:
-    # 授權驗證（暫時停用，測試用）
-    # from license_check import require_license
-    # customer = require_license()
-    # if customer:
-    #     print(f"  歡迎, {customer}!\n")
-    pass
-
     # Concurrency from CLI arg, falling back to config, then hardcoded default
     concurrency = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_CONCURRENCY
 
@@ -728,6 +750,7 @@ async def main() -> None:
     print()
 
     start_time = time.time()
+    failed: list = []
 
     connector = aiohttp.TCPConnector(
         limit=concurrency,
@@ -739,7 +762,14 @@ async def main() -> None:
         out_dir = Path(OUTPUT_DIR)
 
         for country_id in selected_ids:
-            members = await scrape_country(session, country_id, concurrency)
+            try:
+                members = await scrape_country(session, country_id, concurrency)
+            except BniApiError:
+                raise  # 格式改版：後面的國家也一定失敗，直接停
+            except Exception as exc:
+                logger.exception("%s 爬取失敗，略過", COUNTRIES[country_id][0])
+                failed.append(f"{COUNTRIES[country_id][0]} ({type(exc).__name__})")
+                continue
             all_members.extend(members)
 
             # Per-country output
@@ -766,6 +796,8 @@ async def main() -> None:
     print(f"  爬取完成!")
     print(f"  國家: {', '.join(selected_names)}")
     print(f"  會員總數: {len(all_members):,}")
+    if failed:
+        print(f"  失敗: {', '.join(failed)}")
     print(f"  耗時: {elapsed:.1f} 秒 ({elapsed/60:.1f} 分鐘)")
     if elapsed > 0:
         print(f"  速度: {len(all_members)/elapsed:.1f} 會員/秒")
