@@ -103,6 +103,14 @@ class ScrapeRequest(BaseModel):
     concurrency: int = DEFAULT_CONCURRENCY
 
 
+# Cloud Run 只有一台 1 vCPU 機器：同時跑多個爬取任務會把 CPU 吃滿（查進度、
+# 下載被 Cloud Run 回 429 Rate exceeded），也會開太多連線被 BNI 斷線。
+# 所以一次只跑一個任務，其他的排隊。
+_SCRAPE_LOCK = asyncio.Lock()
+_BACKGROUND_TASKS: set = set()
+MAX_CONCURRENCY = 50
+
+
 # ── Scrape worker ────────────────────────────────────────────────────────────
 
 
@@ -117,6 +125,14 @@ def _job_progress(job: dict[str, Any]):
 
 
 async def _run_job(job_id: str, country_ids: list[int], concurrency: int) -> None:
+    job = JOBS[job_id]
+    if _SCRAPE_LOCK.locked():
+        job["log"].append("前面還有其他爬取任務，排隊中⋯")
+    async with _SCRAPE_LOCK:
+        await _run_job_now(job_id, country_ids, concurrency)
+
+
+async def _run_job_now(job_id: str, country_ids: list[int], concurrency: int) -> None:
     job = JOBS[job_id]
     job["status"] = "running"
     job["started_at"] = time.time()
@@ -188,13 +204,15 @@ async def start_scrape(
     if invalid:
         raise HTTPException(400, f"未知 country_id: {invalid}")
 
+    concurrency = max(1, min(req.concurrency, MAX_CONCURRENCY))
     job_id = uuid.uuid4().hex[:12]
     JOBS[job_id] = {
         "id": job_id,
         "status": "queued",
+        "created_at": time.time(),
         "country_ids": req.country_ids,
         "country_names": [COUNTRIES[c][0] for c in req.country_ids],
-        "concurrency": req.concurrency,
+        "concurrency": concurrency,
         "stage": "queued",
         "log": [],
         "members_count": 0,
@@ -213,7 +231,10 @@ async def start_scrape(
     }
 
     # Schedule the coroutine on the running loop so we don't block the response.
-    asyncio.create_task(_run_job(job_id, req.country_ids, req.concurrency))
+    # 保留 task 參照，避免背景任務被垃圾回收中途消失。
+    task = asyncio.create_task(_run_job(job_id, req.country_ids, concurrency))
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
     return {"job_id": job_id}
 
 
@@ -224,6 +245,12 @@ async def job_status(job_id: str) -> dict:
     job = JOBS[job_id]
     # Don't leak the absolute file path — only expose a download URL when ready.
     public = {k: v for k, v in job.items() if k != "csv_path"}
+    if job.get("status") == "queued":
+        public["queue_ahead"] = sum(
+            1 for other in JOBS.values()
+            if other["status"] == "running"
+            or (other["status"] == "queued" and other["created_at"] < job["created_at"])
+        )
     if job.get("status") == "done":
         public["download_url"] = f"/api/download/{job_id}"
     return public

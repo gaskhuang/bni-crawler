@@ -340,7 +340,7 @@ function renderStats(job) {
 function progressFor(job) {
   // Compose a single 0-100 number across the stages we know about.
   switch (job.stage) {
-    case "queued":           return [2,  "排隊中"];
+    case "queued":           return [2,  job.queue_ahead ? `排隊中（前面還有 ${job.queue_ahead} 個任務）` : "排隊中"];
     case "widget_settings":  return [5,  "讀取頁面設定"];
     case "regions":          return [8,  "取得區域清單"];
     case "chapter_discovery":return [12, "發現分會中"];

@@ -574,7 +574,9 @@ async def fetch_members_for_chapter(
     if len(html_text) < 100:
         return []
 
-    return _parse_member_rows(
+    # HTML 解析很吃 CPU，丟到執行緒，讓 event loop（Web UI 的查進度/下載）保持順暢。
+    return await asyncio.to_thread(
+        _parse_member_rows,
         html_text, country_id, region_id, region_name,
         chapter_id=ch_id, chapter_name_filter=ch_name,
     )
@@ -605,7 +607,8 @@ async def fetch_member_detail(
             f"詳情 {member.get('member_name', '?')}", timeout=20,
         )
 
-    for key, value in parse_member_detail_html(html_content).items():
+    parsed = await asyncio.to_thread(parse_member_detail_html, html_content)
+    for key, value in parsed.items():
         if value and not member.get(key):
             member[key] = value
     return member
